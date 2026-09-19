@@ -1,0 +1,60 @@
+[project]
+name = "live-recorder"
+version = "0.1.0"
+description = "Live meeting transcription: microphone + system audio (loopback), Silero VAD + switchable STT (whisper / GigaAM)."
+readme = "kind-hatching-allen.md"
+requires-python = ">=3.12"
+dependencies = [
+    # Pinned to keep whisper and GigaAM-v3 in one environment without conflict.
+    "torch==2.8.0",
+    "torchaudio==2.8.0",
+    "transformers==4.57.1",
+    "numpy",
+    "silero-vad",
+    # silero-vad 6.x imports onnxruntime at package import time but does not
+    # declare it as a dependency; required for `import silero_vad` to succeed.
+    "onnxruntime",
+    "soundcard",
+    "soundfile",
+    "soxr",
+    "pydantic-settings",
+    "python-dotenv",
+    "PySide6",
+]
+
+[project.optional-dependencies]
+# Extra deps required only by the GigaAM-v3 engine (stt/gigaam_engine.py).
+# Install with: uv sync --extra gigaam
+gigaam = [
+    "pyannote-audio==4.0.0",
+    "hydra-core",
+    "omegaconf",
+    "sentencepiece",
+    "torchcodec==0.7.0",
+]
+
+[project.scripts]
+live-recorder = "app.__main__:_run"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["app"]
+
+# --- torch index selection --------------------------------------------------
+# CPU is the target environment (work machine without a GPU): the default PyPI
+# index ships CPU builds of torch/torchaudio, so no extra index is configured.
+#
+# To switch to a CUDA build (optional, if a GPU becomes available), uncomment
+# the block below and run `uv sync` again:
+#
+# [[tool.uv.index]]
+# name = "pytorch-cu128"
+# url = "https://download.pytorch.org/whl/cu128"
+# explicit = true
+#
+# [tool.uv.sources]
+# torch = { index = "pytorch-cu128" }
+# torchaudio = { index = "pytorch-cu128" }
