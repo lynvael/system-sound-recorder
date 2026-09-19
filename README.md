@@ -1,4 +1,4 @@
-# Live Recorder
+# System Sound Recorder
 
 Лайв-транскрипция встреч: одновременный захват **микрофона** и **системного
 звука** (loopback) на раздельных каналах, детекция речи через **Silero VAD** и
@@ -141,12 +141,12 @@ uv run python -m app.cli record --mic-id "<id микрофона>" --loopback-id
 Настройки читаются из `.env` (см. `.env.example`) через `pydantic-settings`.
 Не заданные ключи используют значения по умолчанию из `app/config.py`.
 
-| Группа | Ключевые переменные | Назначение |
-| --- | --- | --- |
-| STT | `STT_ENGINE` (whisper/gigaam), `STT_WHISPER_MODEL_ID`, `STT_GIGAAM_MODEL_ID`, `STT_GIGAAM_REVISION` (e2e_rnnt/e2e_ctc), `STT_LANGUAGE`, `STT_DEVICE` (auto/cpu/cuda:0) | Выбор и настройка движка распознавания |
-| VAD | `VAD_THRESHOLD`, `VAD_SILENCE_TIMEOUT`, `VAD_MAX_DURATION` | Чувствительность детекции речи и нарезка длинных сегментов |
-| Capture | `CAPTURE_FRAME_SIZE`, `CAPTURE_TARGET_SAMPLE_RATE`, `CAPTURE_CHUNK_FRAMES`, `CAPTURE_MIC_LABEL`, `CAPTURE_LOOPBACK_LABEL`, `CAPTURE_NEUTRAL_LABEL` | Параметры захвата аудио и метки спикеров |
-| Session | `SESSION_MODE` (live/batch/file), `SESSION_OUTPUT_DIR` | Режим по умолчанию и каталог сессий |
+| Группа  | Ключевые переменные                                                                                                                                                    | Назначение                                                 |
+| ------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ---------------------------------------------------------- |
+| STT     | `STT_ENGINE` (whisper/gigaam), `STT_WHISPER_MODEL_ID`, `STT_GIGAAM_MODEL_ID`, `STT_GIGAAM_REVISION` (e2e_rnnt/e2e_ctc), `STT_LANGUAGE`, `STT_DEVICE` (auto/cpu/cuda:0) | Выбор и настройка движка распознавания                     |
+| VAD     | `VAD_THRESHOLD`, `VAD_SILENCE_TIMEOUT`, `VAD_MAX_DURATION`                                                                                                             | Чувствительность детекции речи и нарезка длинных сегментов |
+| Capture | `CAPTURE_FRAME_SIZE`, `CAPTURE_TARGET_SAMPLE_RATE`, `CAPTURE_CHUNK_FRAMES`, `CAPTURE_MIC_LABEL`, `CAPTURE_LOOPBACK_LABEL`, `CAPTURE_NEUTRAL_LABEL`                     | Параметры захвата аудио и метки спикеров                   |
+| Session | `SESSION_MODE` (live/batch/file), `SESSION_OUTPUT_DIR`                                                                                                                 | Режим по умолчанию и каталог сессий                        |
 
 Полезные детали:
 
@@ -174,9 +174,9 @@ uv run python -m app.cli record --mic-id "<id микрофона>" --loopback-id
 В каталоге `scripts/` — обёртки, которые не требуют помнить команды и не
 зависят от текущей директории запуска:
 
-| Скрипт | Назначение |
-| --- | --- |
-| `scripts/run-gui.ps1` / `scripts/run-gui.bat` | Запуск GUI (`uv run python -m app`) |
+| Скрипт                                        | Назначение                                                |
+| --------------------------------------------- | --------------------------------------------------------- |
+| `scripts/run-gui.ps1` / `scripts/run-gui.bat` | Запуск GUI (`uv run python -m app`)                       |
 | `scripts/run-cli.ps1` / `scripts/run-cli.bat` | Проброс аргументов в CLI (`uv run python -m app.cli ...`) |
 
 Пример:
