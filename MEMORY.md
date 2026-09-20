@@ -25,6 +25,17 @@ segmenter, `app/common/{config,log}.py`).
   soxr resampler read it from config; do NOT hardcode 16000 elsewhere or channels desync.
 - **CPU is the target env**; live is best-effort (GigaAM-v3 on CPU is slower than
   real-time). file-mode is the reliable + primary regression path.
+- **Mic noise-suppression (NS) ADR exists but is DEPRIORITIZED / not started** (Luno,
+  2026-09-20). Recommendation: RNNoise (`rnnnoise` pkg) in `CaptureThread` at 48 kHz,
+  before soxr, mic channel only; NS-processed mic written into `session.wav` (keeps
+  live==batch==re-read consistent); config `CAPTURE_NOISE_SUPPRESSION` default on; GUI
+  checkbox; CLI `--no-noise-suppression`. Alternatives weighed: WebRTC NS (permissive
+  licence, lower quality), `noisereduce` (offline-only → live≠batch), OS-level (not
+  controllable). IMPORTANT: NS solves BACKGROUND noise (fan/keyboard) — it does NOT fix
+  the «Я»/«Собеседники» duplication, which is an ELECTRICAL bleed (see Gotchas). Do not
+  implement NS expecting it to fix the duplication. Open ADR questions were: default on?,
+  GPL-3.0 (RNNoise) acceptable?, losing the raw mic acceptable? — all deferred along with
+  the bleed decision.
 
 ## Conventions / contracts (don't break)
 - **`on_error` callback = TERMINAL only** (session is ending). Non-terminal problems
@@ -120,23 +131,51 @@ segmenter, `app/common/{config,log}.py`).
   worker resets) instead of recording hours of silence. `_handle_capture_errors` (called in
   `_stop_live`/`_stop_batch`) is the stop-time safety net for channels that resolved OK at
   start but died mid-run.
-- **The user's live "system-audio duplicated" symptom is ACOUSTIC ECHO, not the device bug.**
-  In the user's setup the Realtek mic picks up system audio played through the monitor
-  speakers (GM27-CFX). Evidence (cross-correlation of mic.wav vs loopback.wav, 2026-09-20
-  sessions): mic channel ≈ loopback delayed ~31 ms (consistent +30/+33/+31 ms across
-  sessions), ~8x lower level, 0.98 corr in speech windows; mic channel ALSO contains the
-  user's own voice (so it is the real mic, not a loopback endpoint). VAD segments the echo
-  and GigaAM transcribes it → others' phrases appear twice («Собеседники» + «Я»). The
-  fuzzy-fallback fix above is NOT the cause of these sessions. User's "mic off" (method
-  unknown) did NOT silence the OS capture — the 21:05 session still carries the echo.
-  Fix implemented (2026-09-20): GUI checkbox «Записывать микрофон» (default on) →
-  `SessionParams.record_mic` → `Session(record_mic=...)`; CLI: `record --no-mic`
-  (then `--mic-id` optional). When off the mic capture+feeder are simply not
-  started; AlignedRecorder silence-pads the left channel, so transcript is
-  loopback-only and mic.wav is silent. Verified with a live test session.
-  Segment-level echo gating (skip «Я» segments highly correlated with loopback
-  audio in the same window; user's own speech is uncorrelated and survives)
-  remains a future option if the user wants mic ON without echo.
+- **The user's live "system-audio duplicated" symptom is an ELECTRICAL bleed
+  (codec crosstalk / ground loop) into the mic channel — NOT acoustic echo, NOT the
+  device bug.** The «Я» (mic) channel carries the system/stream audio via a path inside
+  the PC's audio hardware (Realtek codec output → mic preamp/ADC) that the physical mic
+  mute does NOT cut. Evidence (2026-09-20, cross-correlation of mic.wav vs loopback.wav
+  + a controlled speaker test):
+  - mic channel ≈ loopback delayed ~30 ms (stable +28…+37 ms, drifting to +48 ms late in
+    long sessions), ~17–20 dB lower level (≈3–10% of the output signal), per-window corr
+    0.29–0.98; mic spectral tilt ≈ loopback (an acoustic path via the monitor speakers
+    would be markedly darker in the highs).
+  - DECISIVE TEST: with the monitor speakers physically at volume 0, the stream audio in
+    «Я» stayed at the SAME level → the path is electrical (inside the codec / via shared
+    ground), not through the air. An acoustic path would have vanished.
+  - The physical mic mute mutes the user's own voice (the capsule) but NOT the bleed (it
+    enters after the mute point, at the preamp/ADC). Session 225815 (mic physically
+    muted): user's voice absent except a "Раз-раз" mic-test at 00:15 (before the mute),
+    stream audio present all session. Session 230147 (mic off via the app checkbox): «Я»
+    fully silent (−180 dB).
+  - The fuzzy-fallback device bug is NOT the cause (the «Я» channel is the real Realtek
+    mic endpoint, validated by exact-id + isloopback check).
+  Consequences: (a) the physical mic toggle is USELESS for this problem; (b) headphones
+  will NOT help (the bleed is in the PC, not the room); (c) NOISE SUPPRESSION will NOT
+  help (the bleed is speech, not noise) — the RNNoise NS ADR (see below) solves a
+  different problem (background fan/keyboard noise) and is NOT the fix for the
+  duplication.
+  Working workaround (implemented 2026-09-20): GUI checkbox «Записывать микрофон»
+  (default on) → `SessionParams.record_mic` → `Session(record_mic=...)`; CLI
+  `record --no-mic` (then `--mic-id` optional). When off the mic capture+feeder are not
+  started; AlignedRecorder silence-pads the left channel → loopback-only transcript,
+  mic.wav silent. Verified (session 230147).
+  **DECISION PENDING (user deferred, 2026-09-20): is the user's own voice needed in «Я»?**
+  Options on the table:
+  1. App checkbox (mic off) — no code, but loses own voice.
+  2. Try a different OUTPUT device (HDMI↔3.5 mm) — free test; if the bleed disappears on
+     another output, the coupling is on a specific line.
+  3. USB microphone — own ADC/ground, usually eliminates the bleed (purchase).
+  4. AEC (real-time, e.g. WebRTC AEC3) — software, keeps mic on + own voice, cancels the
+     loopback-correlated component at capture.
+  5. Echo-gating (post-hoc) — software, cheap, retroactive on recorded sessions: drop «Я»
+     VAD segments highly correlated with loopback in the same window; user's own
+     (uncorrelated) speech survives.
+  Diagnostic method that worked (reusable): per-30s-window FFT cross-correlation of
+  mic.wav vs loopback.wav (peak lag + normalized corr), per-window spectral tilt
+  (hi 4–8k / lo 0.3–1k), and Silero VAD speech-fraction on the residual (mic − best-lag
+  scaled loopback copy) to detect the user's own voice.
 - **`silero-vad==6.2.2` imports `onnxruntime` at package import but doesn't declare it** —
   `onnxruntime` is in base deps for this reason. Don't remove it.
 - **Native capture rate is assumed 48000 Hz** (`soundcard` needs an explicit samplerate
