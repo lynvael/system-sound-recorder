@@ -5,10 +5,11 @@ Facts that help future work and are NOT obvious from the code alone.
 ## What this is
 Windows desktop app (single Python process) for live meeting transcription: captures
 mic ("Я", left channel) + system-audio loopback ("Собеседники", right channel) on
-separate channels, Silero VAD per channel, switchable STT (whisper / GigaAM-v3),
+separate channels, Silero VAD per channel, GigaAM-v3 STT (Russian-only; the sole
+engine — whisper was removed),
 PySide6 GUI + headless CLI (`app/cli.py`). Design spec: `kind-hatching-allen.md` (RU).
-Reused near-verbatim from sibling project `C:\develop\Chisa` (whisper STT + Silero
-segmenter in `app/stt/engine.py`, `app/common/{config,log}.py`).
+Originally reused near-verbatim from sibling project `C:\develop\Chisa` (STT + Silero
+segmenter, `app/common/{config,log}.py`).
 
 ## Architecture decisions & why
 - **Disk is the single source of truth.** One stereo WAV `session.wav` (16 kHz, PCM16,
@@ -22,8 +23,8 @@ segmenter in `app/stt/engine.py`, `app/common/{config,log}.py`).
   segments (correctness > latency for a recorder). Backlog depth is surfaced to the GUI.
 - **`target_sample_rate` (16000) in config is the single source of truth** — VAD and the
   soxr resampler read it from config; do NOT hardcode 16000 elsewhere or channels desync.
-- **CPU is the target env**; live is best-effort (turbo/large slower than real-time).
-  file-mode is the reliable + primary regression path.
+- **CPU is the target env**; live is best-effort (GigaAM-v3 on CPU is slower than
+  real-time). file-mode is the reliable + primary regression path.
 
 ## Conventions / contracts (don't break)
 - **`on_error` callback = TERMINAL only** (session is ending). Non-terminal problems
@@ -36,7 +37,6 @@ segmenter in `app/stt/engine.py`, `app/common/{config,log}.py`).
   resets — applies to `_start_live`, `_start_recording_only`, and `_start_file`.
 - Mid-run recorder-writer death drives a real teardown via a daemon thread calling
   `stop()` (can't call stop() inline — it joins the writer thread → self-join deadlock).
-- Language `"auto"` is mapped to `None` before constructing Session (both GUI and CLI).
 - CLI path must NOT import PySide6 (keep Qt imports lazy / GUI-only).
 - **Per-channel WAVs are DERIVED from the aligned stereo, not a replacement for it.**
   `session.wav` (stereo) stays the single source of truth; `AlignedRecorder` additionally
@@ -59,22 +59,10 @@ segmenter in `app/stt/engine.py`, `app/common/{config,log}.py`).
   failing stays non-terminal (`on_status`) per the contract above; but when
   `_attempted > 0 and _failed == _attempted` (every attempted segment failed) the session
   emits a terminal `on_error` just before `_finish()` — defense-in-depth against the
-  torchcodec-style "empty transcript, no error" trap. Guarded by `_attempted > 0` so a
+  "empty transcript, no error" trap (e.g. GigaAM's over-30s swallow, below). Guarded by `_attempted > 0` so a
   zero-speech recording (VAD found nothing) never false-positives.
 
 ## Gotchas / traps
-- **Broken `torchcodec` silently empties whisper transcripts.** transformers 4.57.1's
-  ASR pipeline runs `import torchcodec` in `preprocess` (every `pipe()` call) whenever
-  torchcodec is merely *installed* (`find_spec` gate — it never verifies the native lib
-  loads). torchcodec comes via the `[gigaam]` extra; if its native lib can't load
-  (FFmpeg/torch mismatch) EVERY whisper segment raises `RuntimeError`. The session
-  worker's per-segment `except` swallows that as a non-terminal skip → completed
-  recording with an EMPTY transcript and NO error. Fixed in `WhisperEngine.__init__`
-  via `_neutralize_broken_torchcodec()`: only when torchcodec is present but genuinely
-  fails to import, it sets `transformers.utils.import_utils._torchcodec_available =
-  False` so the pipeline skips the dead import (we always feed `{"raw", "sampling_rate"}`,
-  never a decoder object). A working torchcodec is left untouched. GigaAM is unaffected
-  (bypasses the transformers pipeline entirely).
 - **Don't import `soundcard` (directly or transitively) at module scope in GUI code
   that loads before `QApplication` exists** — it breaks launch with
   `QWindowsContext: OleInitialize() failed: COM error 0x80010106 (RPC_E_CHANGED_MODE)`.
@@ -124,7 +112,7 @@ segmenter in `app/stt/engine.py`, `app/common/{config,log}.py`).
   via `config.vad` threaded through the factory (engine `__init__(stt, sample_rate, vad)`),
   Silero loads LAZILY on first long segment. If sub-VAD yields ZERO chunks for known-speech
   audio, `_fixed_windows` hard-splits into ≤20s windows so a long segment is never dropped.
-  Sub-chunk transcribe errors propagate (non-terminal). Whisper is unaffected.
+  Sub-chunk transcribe errors propagate (non-terminal).
 - `transformers==4.57.1` pipeline uses the kwarg `dtype` (NOT `torch_dtype`).
 - Drift-trim bound in recorder is `_DRIFT_TRIM_SECONDS = 1.0` — tune after a 30–60 min
   sync test if drift becomes audible.
@@ -140,7 +128,7 @@ segmenter in `app/stt/engine.py`, `app/common/{config,log}.py`).
 ## Not yet verified (needs real hardware — none in the build env)
 No mic / GPU / model downloads were available during implementation. Static correctness,
 clean imports, `uv sync`, and `list-devices` were verified. Still needs the user's manual
-run: actual capture, VAD segmentation on real audio, whisper + gigaam transcription,
+run: actual capture, VAD segmentation on real audio, GigaAM transcription,
 GUI live/batch/file runs, CPU RTF measurement, hour-long RAM-stability + channel-sync
 tests. See "Верификация" in `kind-hatching-allen.md`.
 

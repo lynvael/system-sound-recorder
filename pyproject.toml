@@ -1,11 +1,11 @@
 [project]
 name = "live-recorder"
 version = "0.1.0"
-description = "Live meeting transcription: microphone + system audio (loopback), Silero VAD + switchable STT (whisper / GigaAM)."
+description = "Live meeting transcription: microphone + system audio (loopback), Silero VAD + GigaAM-v3 STT."
 readme = "README.md"
 requires-python = ">=3.12"
 dependencies = [
-    # Pinned to keep whisper and GigaAM-v3 in one environment without conflict.
+    # Pinned for GigaAM-v3 compatibility.
     "torch==2.8.0",
     "torchaudio==2.8.0",
     "transformers==4.57.1",

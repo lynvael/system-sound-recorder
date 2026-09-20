@@ -2,9 +2,8 @@
 
 Лайв-транскрипция встреч: одновременный захват **микрофона** и **системного
 звука** (loopback) на раздельных каналах, детекция речи через **Silero VAD** и
-распознавание переключаемым **STT**-движком (whisper-large-v3-turbo или
-GigaAM-v3). Есть десктоп-GUI на PySide6 и headless CLI для сценариев без
-интерфейса.
+распознавание речи через **STT**-движок **GigaAM-v3**. Есть десктоп-GUI на
+PySide6 и headless CLI для сценариев без интерфейса.
 
 Каналы не смешиваются: микрофон → «Я», системный звук → «Собеседники». Сессия
 целиком пишется на диск (`session.wav`), поэтому её всегда можно
@@ -25,8 +24,9 @@ GigaAM-v3). Есть десктоп-GUI на PySide6 и headless CLI для сц
 uv sync
 ```
 
-Это ставит базовый набор (whisper, CPU-сборка torch). Чтобы добавить движок
-GigaAM-v3 (только русский язык):
+Это ставит базовый набор (GUI, VAD, захват аудио, CPU-сборка torch). Чтобы
+добавить STT-движок GigaAM-v3 (единственный движок распознавания, только
+русский язык):
 
 ```powershell
 uv sync --extra gigaam
@@ -49,10 +49,7 @@ uv run python -m app
 В окне доступны:
 
 - выпадающие списки **микрофона** и **системного звука (loopback)**;
-- выбор **модели**: whisper / gigaam;
 - выбор **режима**: live / после записи (batch) / файл;
-- выбор **языка**: russian / english / auto (для whisper; GigaAM всегда
-  русский);
 - кнопки **Старт** / **Стоп**;
 - кнопка **«Открыть аудиофайл…»** — импорт готового WAV/аудио в режиме
   «файл»;
@@ -79,19 +76,16 @@ python -m app.cli list-devices
 ### Расшифровка готового файла
 
 ```
-python -m app.cli transcribe FILE [--engine {whisper,gigaam}] [--language {russian,english,auto}] [--output-dir DIR]
+python -m app.cli transcribe FILE [--output-dir DIR]
 ```
 
-- `--engine` — по умолчанию `whisper`.
-- `--language` — по умолчанию `auto` (для whisper; GigaAM игнорирует язык —
-  только русский).
 - `--output-dir` — куда писать папку сеанса (по умолчанию — `session.output_dir`
   из конфига, т.е. `recordings`).
 
 Пример:
 
 ```powershell
-uv run python -m app.cli transcribe recording.wav --engine whisper --language russian
+uv run python -m app.cli transcribe recording.wav
 ```
 
 Файл с двумя каналами трактуется как своя сессия (`session.wav`) с полной
@@ -100,18 +94,18 @@ uv run python -m app.cli transcribe recording.wav --engine whisper --language ru
 ### Запись с устройств
 
 ```
-python -m app.cli record --mic-id ID --loopback-id ID [--mode {live,batch}] [--engine {whisper,gigaam}] [--language {russian,english,auto}] [--output-dir DIR]
+python -m app.cli record --mic-id ID --loopback-id ID [--mode {live,batch}] [--output-dir DIR]
 ```
 
 - `--mic-id` / `--loopback-id` — обязательны, берутся из `list-devices`.
 - `--mode` — `live` (расшифровка по ходу записи) или `batch` (расшифровка
   запускается по остановке); по умолчанию `batch`.
-- `--engine`, `--language`, `--output-dir` — как у `transcribe`.
+- `--output-dir` — как у `transcribe`.
 
 Пример:
 
 ```powershell
-uv run python -m app.cli record --mic-id "<id микрофона>" --loopback-id "<id loopback>" --mode batch --engine gigaam
+uv run python -m app.cli record --mic-id "<id микрофона>" --loopback-id "<id loopback>" --mode batch
 ```
 
 Команда работает до нажатия **Ctrl-C** (или EOF на stdin — удобно в
@@ -198,7 +192,7 @@ TL;DR, ключевые решения, задачи, обсуждённые т�
 
 | Группа  | Ключевые переменные                                                                                                                                                    | Назначение                                                 |
 | ------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ---------------------------------------------------------- |
-| STT     | `STT_ENGINE` (whisper/gigaam), `STT_WHISPER_MODEL_ID`, `STT_GIGAAM_MODEL_ID`, `STT_GIGAAM_REVISION` (e2e_rnnt/e2e_ctc), `STT_LANGUAGE`, `STT_DEVICE` (auto/cpu/cuda:0) | Выбор и настройка движка распознавания                     |
+| STT     | `STT_ENGINE` (единственное значение — `gigaam`), `STT_GIGAAM_MODEL_ID`, `STT_GIGAAM_REVISION` (e2e_rnnt/e2e_ctc), `STT_DEVICE` (auto/cpu/cuda:0)                       | Настройка единственного движка распознавания — GigaAM-v3   |
 | VAD     | `VAD_THRESHOLD`, `VAD_SILENCE_TIMEOUT`, `VAD_MAX_DURATION`                                                                                                             | Чувствительность детекции речи и нарезка длинных сегментов |
 | Capture | `CAPTURE_FRAME_SIZE`, `CAPTURE_TARGET_SAMPLE_RATE`, `CAPTURE_CHUNK_FRAMES`, `CAPTURE_MIC_LABEL`, `CAPTURE_LOOPBACK_LABEL`, `CAPTURE_NEUTRAL_LABEL`                     | Параметры захвата аудио и метки спикеров                   |
 | Session | `SESSION_MODE` (live/batch/file), `SESSION_OUTPUT_DIR`                                                                                                                 | Режим по умолчанию и каталог сессий                        |
@@ -208,14 +202,11 @@ TL;DR, ключевые решения, задачи, обсуждённые т�
 
 - `STT_DEVICE=auto` выбирает `cuda:0`, если доступна видеокарта, иначе `cpu` —
   на рабочей машине без GPU это всегда CPU.
-- Если live на CPU не успевает за речью (turbo/large медленнее реального
-  времени), задайте более лёгкую модель через `STT_WHISPER_MODEL_ID`
-  (например, `openai/whisper-small`) как быстрый путь для живой расшифровки.
 
 ## Особенности и ограничения
 
-- **Live на CPU — best-effort.** whisper-large-v3-turbo и GigaAM-v3 на CPU
-  часто медленнее реального времени; очередь STT **никогда не дропает
+- **Live на CPU — best-effort.** GigaAM-v3 на CPU часто медленнее реального
+  времени; очередь STT **никогда не дропает
   сегменты**, а отстаёт и догоняет в паузах (индикатор бэклога в GUI). Надёжный
   вариант — batch/file-расшифровка уже записанного `session.wav`.
 - **GigaAM — только русский язык** и транскрибирует через временный WAV-файл
@@ -238,5 +229,5 @@ TL;DR, ключевые решения, задачи, обсуждённые т�
 Пример:
 
 ```powershell
-.\scripts\run-cli.ps1 transcribe recording.wav --engine whisper
+.\scripts\run-cli.ps1 transcribe recording.wav
 ```
