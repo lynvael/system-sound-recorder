@@ -306,7 +306,7 @@ class MainWindow(QMainWindow):
             ("Длительность:", self._session_duration_label),
             ("Сегментов/слов:", self._session_counts_label),
             ("Реплики:", self._session_speakers_label),
-            ("STT/язык:", self._session_engine_label),
+            ("STT:", self._session_engine_label),
             ("Очередь STT:", self._session_backlog_label),
             ("Идёт:", self._session_elapsed_label),
         ]

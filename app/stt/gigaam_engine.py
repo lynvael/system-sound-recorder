@@ -25,7 +25,7 @@ import soundfile as sf
 
 from app.config import STTSettings, VADSettings
 from app.log import get_logger
-from app.vad.segmenter import PREROLL_FRAMES, ContinuousSegmenter, load_silero_vad
+from app.vad.segmenter import ContinuousSegmenter, load_silero_vad
 
 logger = get_logger("stt.gigaam")
 
