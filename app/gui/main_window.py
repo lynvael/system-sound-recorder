@@ -190,19 +190,19 @@ class MainWindow(QMainWindow):
         for label, value in MODE_ITEMS:
             self.mode_combo.addItem(label, value)
 
-        grid.addWidget(QLabel("Микрофон:"), 0, 0)
-        grid.addWidget(self.mic_combo, 0, 1)
-        grid.addWidget(self.mic_check, 1, 1, 1, 2)
-        grid.addWidget(QLabel("Системный звук:"), 2, 0)
-        grid.addWidget(self.loopback_combo, 2, 1)
-        grid.addWidget(QLabel("Модель:"), 3, 0)
-        grid.addWidget(self.model_combo, 3, 1)
-        grid.addWidget(QLabel("Режим:"), 0, 2)
-        grid.addWidget(self.mode_combo, 0, 3)
+        grid.addWidget(QLabel("Режим:"), 0, 0)
+        grid.addWidget(self.mode_combo, 0, 1)
+        grid.addWidget(QLabel("Микрофон:"), 1, 0)
+        grid.addWidget(self.mic_combo, 1, 1)
+        grid.addWidget(self.mic_check, 2, 1, 1, 2)
+        grid.addWidget(QLabel("Системный звук:"), 3, 0)
+        grid.addWidget(self.loopback_combo, 3, 1)
+        grid.addWidget(QLabel("Модель:"), 4, 0)
+        grid.addWidget(self.model_combo, 4, 1)
 
         self.open_file_button = QPushButton("Открыть аудиофайл…", controls_group)
         self.open_file_button.setEnabled(False)
-        grid.addWidget(self.open_file_button, 3, 2, 1, 1)
+        grid.addWidget(self.open_file_button, 0, 2, 1, 1)
 
         # Persistent (non-transient) indicator of the file picked in File
         # mode -- unlike the status-bar message this used to rely on, it
@@ -210,14 +210,12 @@ class MainWindow(QMainWindow):
         # File mode; see `_update_mode_dependent_widgets`.
         self._import_file_label = QLabel("Файл не выбран", controls_group)
         self._import_file_label.setStyleSheet("color: #5f6368;")
-        grid.addWidget(self._import_file_label, 3, 3, 1, 1)
+        grid.addWidget(self._import_file_label, 0, 3, 1, 1)
 
         self.session_name_edit = QLineEdit(controls_group)
-        self.session_name_edit.setPlaceholderText(
-            "необязательно — дата/время"
-        )
-        grid.addWidget(QLabel("Название сеанса:"), 4, 0)
-        grid.addWidget(self.session_name_edit, 4, 1, 1, 3)
+        self.session_name_edit.setPlaceholderText("необязательно — дата/время")
+        grid.addWidget(QLabel("Название сеанса:"), 5, 0)
+        grid.addWidget(self.session_name_edit, 5, 1, 1, 3)
 
         root.addWidget(controls_group)
 
@@ -281,18 +279,14 @@ class MainWindow(QMainWindow):
         # -- picker ---------------------------------------------------------
         picker_row = QHBoxLayout()
         self.session_combo = QComboBox(panel)
-        self.session_combo.setSizePolicy(
-            QSizePolicy.Expanding, QSizePolicy.Fixed
-        )
+        self.session_combo.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
         self.refresh_sessions_button = QPushButton("Обновить", panel)
         picker_row.addWidget(self.session_combo, stretch=1)
         picker_row.addWidget(self.refresh_sessions_button)
         layout.addLayout(picker_row)
 
         self.session_state_badge = QLabel("—")
-        self.session_state_badge.setStyleSheet(
-            "font-weight: bold; padding: 2px 0;"
-        )
+        self.session_state_badge.setStyleSheet("font-weight: bold; padding: 2px 0;")
         layout.addWidget(self.session_state_badge)
 
         # -- info -------------------------------------------------------
@@ -582,6 +576,7 @@ class MainWindow(QMainWindow):
             self._session_counts_label.setText("—")
             self._session_speakers_label.setText("—")
         else:
+
             def _end(s: dict) -> float:
                 try:
                     return float(s.get("end", 0.0))
@@ -635,15 +630,13 @@ class MainWindow(QMainWindow):
             and session_dir == self._active_session_dir
         )
         any_summarizing = self._summarizing_dir is not None
-        has_transcript = session_dir is not None and (
-            session_dir / "transcript.json"
-        ).exists()
-        has_report = session_dir is not None and (
-            session_dir / "summary.docx"
-        ).exists()
-        has_transcript_txt = session_dir is not None and (
-            session_dir / "transcript.txt"
-        ).exists()
+        has_transcript = (
+            session_dir is not None and (session_dir / "transcript.json").exists()
+        )
+        has_report = session_dir is not None and (session_dir / "summary.docx").exists()
+        has_transcript_txt = (
+            session_dir is not None and (session_dir / "transcript.txt").exists()
+        )
 
         self.summarize_button.setEnabled(
             has_transcript and not is_active_recording and not any_summarizing
@@ -784,7 +777,9 @@ class MainWindow(QMainWindow):
             return
         if self._recording and self._active_session_dir == session_dir:
             # Also enforced by the button's enabled state; defense in depth.
-            verb = "обработка файла" if self._active_session_is_file_mode() else "запись"
+            verb = (
+                "обработка файла" if self._active_session_is_file_mode() else "запись"
+            )
             self._show_error(f"Нельзя удалить сеанс, пока идёт {verb}.")
             return
         if session_dir == self._summarizing_dir:
