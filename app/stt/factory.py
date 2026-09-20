@@ -15,7 +15,7 @@ logger = get_logger("stt.factory")
 
 
 def build_engine(config: Config) -> ASREngine:
-    """Construct the ASREngine named by config.stt.engine ("whisper"|"gigaam")."""
+    """Construct the ASREngine named by config.stt.engine ("gigaam")."""
     engine = config.stt.engine.lower()
     sample_rate = config.capture.target_sample_rate
     if engine == "gigaam":
@@ -23,8 +23,8 @@ def build_engine(config: Config) -> ASREngine:
         # extra dependencies are missing, so no extra ImportError handling here.
         from app.stt.gigaam_engine import GigaAMEngine
 
-        return GigaAMEngine(config.stt, sample_rate)
+        return GigaAMEngine(config.stt, sample_rate, config.vad)
 
     raise ValueError(
-        f"Unknown STT engine {config.stt.engine!r} (expected 'whisper' or 'gigaam')"
+        f"Unknown STT engine {config.stt.engine!r} (expected 'gigaam')"
     )

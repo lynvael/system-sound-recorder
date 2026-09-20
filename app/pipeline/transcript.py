@@ -26,6 +26,37 @@ class Segment:
     text: str
 
 
+def merge_consecutive(segments: list[Segment]) -> list[Segment]:
+    """Merge ADJACENT segments sharing the same speaker into one.
+
+    A run of consecutive same-speaker segments becomes a single Segment with
+    start = first.start, end = last.end and the texts joined by a space. Blank
+    texts are skipped when joining. Pure function: the input list and its
+    Segments are not mutated (new Segments are returned).
+    """
+    merged: list[Segment] = []
+    for seg in segments:
+        if merged and merged[-1].speaker == seg.speaker:
+            prev = merged[-1]
+            parts = [p for p in (prev.text, seg.text) if p]
+            merged[-1] = Segment(
+                start=prev.start,
+                end=seg.end,
+                speaker=prev.speaker,
+                text=" ".join(parts),
+            )
+        else:
+            merged.append(
+                Segment(
+                    start=seg.start,
+                    end=seg.end,
+                    speaker=seg.speaker,
+                    text=seg.text,
+                )
+            )
+    return merged
+
+
 def _fmt_clock(seconds: float) -> str:
     """mm:ss (or h:mm:ss past an hour)."""
     seconds = max(0.0, seconds)

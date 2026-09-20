@@ -29,6 +29,7 @@ Threading model used by ``app/gui/main_window.py``:
 
 from __future__ import annotations
 
+import threading
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional
@@ -57,16 +58,16 @@ def load_app_config():
     `.app`, `.capture`, `.stt`, `.vad`, `.session` sub-settings objects
     (each a `pydantic_settings.BaseSettings`). This helper is the ONLY place
     in the GUI that constructs it, and `SessionWorker.start_session` is the
-    only place that mutates it (`config.stt.engine`, `config.stt.language`,
-    `config.session.mode`) before handing it to `Session(config, mode, ...)`.
+    only place that mutates it (`config.stt.engine`, `config.session.mode`)
+    before handing it to `Session(config, mode, ...)`.
 
     TODO(reconcile-with-backend): `app/pipeline/session.py` does not exist
     yet, so it is still unverified that `Session.__init__` reads config
     overrides from these exact attribute paths (vs., e.g., taking
-    `mode`/`engine`/`language` as explicit constructor args instead of
+    `mode`/`engine` as explicit constructor args instead of
     mutating `config` in place). If `Session` turns out to ignore mutated
-    `config.stt.engine` / `config.stt.language` / `config.session.mode`,
-    only `SessionWorker.start_session` needs to change.
+    `config.stt.engine` / `config.session.mode`, only
+    `SessionWorker.start_session` needs to change.
     """
     if load_config is None:
         raise RuntimeError(
@@ -84,11 +85,12 @@ class SessionParams:
     mic_id: Optional[str] = None
     loopback_id: Optional[str] = None
     import_path: Optional[Path] = None
-    engine: str = "whisper"  # "whisper" | "gigaam"
-    # "russian" | "english" | "auto" -- matches app.config.STTSettings.language
-    # verbatim (not ISO codes); "auto" is mapped to None below for the
-    # whisper pipeline's generate_kwargs={"language": ...}.
-    language: str = "auto"
+    engine: str = "gigaam"  # "gigaam"
+    # Optional user-supplied label for the session. Raw text exactly as typed
+    # (may be None, empty, or whitespace) -- `Session` sanitizes it and folds
+    # it into the output folder name, or falls back to a timestamp-only folder
+    # when it's unusable. The GUI does no validation of its own.
+    session_name: Optional[str] = None
 
 
 class SessionWorker(QObject):
@@ -101,9 +103,16 @@ class SessionWorker(QObject):
     finished = Signal(object)  # Path to session dir
     session_dir_ready = Signal(object)  # Path to session dir, known at session start
 
+    # -- on-demand summarization (independent of the live Session above) --
+    summarize_status = Signal(str)
+    summarize_done = Signal(object)  # Path to summary.docx
+    summarize_failed = Signal(str)
+
     def __init__(self, parent: Optional[QObject] = None) -> None:
         super().__init__(parent)
         self._session: Optional[Session] = None
+        self._summarize_lock = threading.Lock()
+        self._summarizing = False
 
     @Slot(object)
     def start_session(self, params: SessionParams) -> None:
@@ -123,7 +132,6 @@ class SessionWorker(QObject):
             # nested settings objects per kind-hatching-allen.md. Adjust here
             # only if the backend's AppSettings shape differs.
             config.stt.engine = params.engine
-            config.stt.language = None if params.language == "auto" else params.language
             config.session.mode = params.mode
 
             self._session = Session(
@@ -132,6 +140,7 @@ class SessionWorker(QObject):
                 mic_id=params.mic_id,
                 loopback_id=params.loopback_id,
                 import_path=params.import_path,
+                name=params.session_name,
                 on_segment=self._emit_segment,
                 on_status=self.status_changed.emit,
                 on_backlog=self.backlog_changed.emit,
@@ -195,3 +204,48 @@ class SessionWorker(QObject):
         # `_session` through its own path instead (`start_session`'s
         # `except`, `_emit_finished`, or `stop_session`'s `finally`).
         self.error.emit(message)
+
+    # -- on-demand summarization ------------------------------------------
+    @Slot(object)
+    def summarize(self, session_dir) -> None:
+        """Run summarization over `session_dir` on a daemon background thread.
+
+        This slot itself runs on the worker `QThread` (queued from the GUI),
+        but `run_summarization` does network/LLM I/O that can take a while,
+        so it must not block this thread's own event loop (the STT
+        session's callbacks are also queued through this same thread's
+        loop). A plain daemon `threading.Thread` mirrors the pattern
+        `Session` already uses for its own background work: emitting a Qt
+        signal from a foreign thread is safe and auto-queues onto whatever
+        thread the connected slot lives on (the GUI thread) -- see the
+        module docstring.
+        """
+        with self._summarize_lock:
+            if self._summarizing:
+                self.summarize_failed.emit("Саммаризация уже выполняется.")
+                return
+            self._summarizing = True
+
+        def _run() -> None:
+            try:
+                # Local import: keeps app.summarize off this module's
+                # import-time surface (symmetry with the lazy soundcard
+                # imports elsewhere in the GUI layer; also avoids paying
+                # for the LLM client import until it's actually used).
+                from app.summarize import run_summarization
+
+                config = load_app_config()
+                path = run_summarization(
+                    session_dir, config, on_status=self.summarize_status.emit
+                )
+            except Exception as exc:  # noqa: BLE001 - surface any failure to the GUI
+                self.summarize_failed.emit(str(exc))
+            else:
+                self.summarize_done.emit(path)
+            finally:
+                with self._summarize_lock:
+                    self._summarizing = False
+
+        threading.Thread(
+            target=_run, name="summarize-worker", daemon=True
+        ).start()

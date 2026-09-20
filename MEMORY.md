@@ -46,6 +46,15 @@ segmenter in `app/stt/engine.py`, `app/common/{config,log}.py`).
   switch to writing only the two mono files — it breaks the source-of-truth invariant,
   the batch `_run_disk_pass` re-read (reads ch0/ch1 of session.wav), and stereo import.
   Filenames are ASCII on purpose (Cyrillic-filename risk); mapping documented in code.
+- **File mode = ALWAYS a single speaker (`neutral_label`, "Speaker") — no diarization.**
+  `_start_file` unconditionally spawns `_run_disk_pass(import_path, stereo=False)`, so any
+  external import (mono or N-channel) downmixes to one mono track via `iter_blocks(channel=
+  None)` and one VAD → one "Speaker". Deliberate product decision: do NOT attempt L/R
+  speaker attribution on foreign files (an ordinary stereo recording has ~identical L/R and
+  dual VAD transcribed every phrase TWICE, once per label). Dual "Я"/"Собеседники"
+  attribution is reserved for BATCH/live re-reading our own `session.wav` (genuine mic vs
+  loopback), which still calls `_run_disk_pass(stereo=True)`. A rejected earlier approach
+  (content-based channel-correlation detection) was intentionally removed for simplicity.
 - **Systemic all-fail surfaces as terminal `on_error` at session end.** A SINGLE segment
   failing stays non-terminal (`on_status`) per the contract above; but when
   `_attempted > 0 and _failed == _attempted` (every attempted segment failed) the session
@@ -103,6 +112,19 @@ segmenter in `app/stt/engine.py`, `app/common/{config,log}.py`).
   `transformers==4.57.1`. GigaAM extras (`[gigaam]`): pyannote-audio, hydra-core,
   omegaconf, sentencepiece, torchcodec. GigaAM is Russian-only and transcribes via a
   temp WAV (model takes a file path, not numpy).
+- **GigaAM `transcribe()` rejects clips over ~30s** ("Too long wav file, use
+  'transcribe_longform' method."). VAD `max_duration` is 60s, so max-length segments
+  overflowed and were silently swallowed by the worker's non-terminal per-segment except
+  (recorded fine, phrases missing, no error). We do NOT use `transcribe_longform` (product
+  decision). Instead `GigaAMEngine.transcribe()` routes any clip ≥ `_MAX_TRANSCRIBE_SECONDS`
+  (24s) to `_transcribe_sliced`: it re-feeds the audio through a FRESH `ContinuousSegmenter`
+  (reused from `app/vad/segmenter.py`) capped at `_SPLIT_MAX_DURATION` (20s, NOT the config's
+  60s), so each sub-chunk is ≤ ~20.3s (max_frames + PREROLL, well under 30s at any Silero
+  rate), short-form `transcribe()`s each, and joins texts chronologically. VAD settings come
+  via `config.vad` threaded through the factory (engine `__init__(stt, sample_rate, vad)`),
+  Silero loads LAZILY on first long segment. If sub-VAD yields ZERO chunks for known-speech
+  audio, `_fixed_windows` hard-splits into ≤20s windows so a long segment is never dropped.
+  Sub-chunk transcribe errors propagate (non-terminal). Whisper is unaffected.
 - `transformers==4.57.1` pipeline uses the kwarg `dtype` (NOT `torch_dtype`).
 - Drift-trim bound in recorder is `_DRIFT_TRIM_SECONDS = 1.0` — tune after a 30–60 min
   sync test if drift becomes audible.
@@ -121,6 +143,72 @@ clean imports, `uv sync`, and `list-devices` were verified. Still needs the user
 run: actual capture, VAD segmentation on real audio, whisper + gigaam transcription,
 GUI live/batch/file runs, CPU RTF measurement, hour-long RAM-stability + channel-sync
 tests. See "Верификация" in `kind-hatching-allen.md`.
+
+## Session naming (`app/pipeline/session.py`, GUI)
+- Sessions can be **optionally named** by the user. GUI: a `QLineEdit` →
+  `SessionParams.session_name` → `Session(name=...)`. Dir is
+  `<YYYYmmdd_HHMMSS>_<sanitized name>` (timestamp PREFIX keeps the picker's
+  name-descending sort chronological AND collision-safe across seconds; empty/
+  None/unusable name → timestamp only, i.e. the original behavior).
+- `_sanitize_session_name` (module fn in session.py): **preserves Cyrillic/
+  Unicode letters** (do NOT ASCII-fold — users name sessions in Russian), strips
+  Windows-unsafe punctuation `< > : " / \ | ? *`, drops all `Cc`/`Cf` chars via
+  `unicodedata.category` (C0/C1/DEL controls + zero-width/bidi like U+200B/U+202E),
+  collapses whitespace→`_`, trims leading/trailing `._ `, caps to 80, and suffixes
+  the STEM (before first dot) when it's a reserved device name (CON/PRN/AUX/NUL/
+  COM1-9/LPT1-9). Audio-file basenames inside the dir stay ASCII (session.wav/
+  mic.wav/loopback.wav) — only the DIRECTORY component is user-controlled.
+- GUI display is **mode-aware**: File mode shows "обработка файла"/"Обработка файла"
+  (it transcribes an existing file, nothing is recorded), live/batch show "запись"/
+  "Идёт запись". Derived from `_active_session_params.mode` via
+  `_active_session_is_file_mode()`; `self._recording` keeps its "session active"
+  semantics unchanged (gates buttons/timer/delete-guard/teardown).
+
+## Summarization (`app/summarize/`)
+- **On-demand, decoupled from Session lifecycle.** `run_summarization()` (the sole
+  public entrypoint, `app/summarize/pipeline.py`) is NOT wired into recording
+  start/stop — it just reads a finished session's `transcript.json` from disk and
+  writes `summary.docx` next to it. Works for any past session under `recordings/`,
+  not just the one just recorded. Called from the GUI's right-hand "Сеанс" panel
+  («Саммаризация» button), off the UI thread.
+- **Final protocol uses the LLM's NATIVE structured output**, not Markdown
+  scraping. `schema.py` defines pydantic `MeetingSummary`{tldr, key_decisions[],
+  tasks[{text, assignee?}], topics[], open_questions[]} + `Task`.
+  `client.chat_structured()` sends `response_format={"type":"json_schema",
+  "json_schema":{...,"strict":True}}` and validates the reply into the model; the
+  free-text MAP pass still uses plain `chat()`. `docx_export.write_docx` renders
+  from the OBJECT (no more `_parse_sections`). Russian section HEADINGS now live in
+  docx_export as the single source of truth.
+- **`strict_json_schema` (schema.py) MUST strip `default` from every node** —
+  genuine OpenAI strict mode 400s on `'default'` (its own SDK strips None defaults).
+  pydantic emits `"default": null` for `assignee: str|None = None`, so `_strictify`
+  pops `default` and sets `additionalProperties:false` + `required=all props` on
+  every object node INCLUDING nested `Task` under `$defs`. Nullable `assignee` stays
+  `anyOf:[string,null]` and stays REQUIRED (OpenAI's nullable pattern). Lenient
+  local servers (llama.cpp/some vLLM) ignore a stray `default`, so this bug only
+  shows against real OpenAI — test there, not just locally.
+- **Map-reduce over an OpenAI-compatible endpoint**, configured entirely via
+  `LLM_*` env vars (`config.llm`: `url`, `api_key`, `model`, `chunk_chars`,
+  `chunk_overlap`, `temperature`, `max_tokens`, `request_timeout`). Consecutive
+  same-speaker segments are merged first (`merge_consecutive` from
+  `app/pipeline/transcript.py`, reused — not duplicated), then the transcript is
+  character-chunked with overlap; each chunk is mapped, and reduce is skipped
+  entirely when there's exactly one chunk.
+- **New base deps**: `openai` (LLM client) and `python-docx` (`.docx` export) —
+  both in `pyproject.toml` base `dependencies`, so plain `uv sync` installs them
+  (no extra needed).
+- **All failures wrapped in `SummarizationError`** (Russian-language message,
+  defined in `app/summarize/pipeline.py`) — missing/empty/malformed transcript,
+  LLM/transport errors, and docx save failures (e.g. file open in Word on
+  Windows) all funnel through it. It is always non-terminal in the GUI: a failed
+  summarization never touches or deletes the existing `transcript.*` files, so
+  retrying is always safe.
+
+## Fixed footguns
+- **`pyproject.toml`'s `readme =` pointed at a nonexistent `kind-hatching-allen.md`**,
+  which broke `uv sync` (hatchling build fails without a valid readme file). Fixed
+  to `readme = "README.md"`. Don't reintroduce a dangling `readme` path — verify
+  the target file actually exists before pointing at it.
 
 ## Env
 Windows, Python >=3.12, package manager **uv**. `uv sync` (base) / `uv sync --extra gigaam`.

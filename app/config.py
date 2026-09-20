@@ -47,20 +47,12 @@ class STTSettings(_Base):
         env_prefix="STT_", env_file=".env", extra="ignore"
     )
 
-    # Which engine to build: "whisper" | "gigaam".
-    engine: str = "whisper"
-
-    # Whisper. On CPU, turbo/large is slower than real time; set a lighter model
-    # (e.g. openai/whisper-small) here as an escape hatch for live latency.
-    whisper_model_id: str = "openai/whisper-large-v3-turbo"
+    # Which engine to build. GigaAM is the only engine.
+    engine: str = "gigaam"
 
     # GigaAM-v3 (Russian only). revision: "e2e_rnnt" | "e2e_ctc" (with punctuation).
     gigaam_model_id: str = "ai-sage/GigaAM-v3"
     gigaam_revision: str = "e2e_rnnt"
-
-    # Whisper language: "russian" | "english" | "auto". GigaAM ignores this
-    # (Russian only). "auto" is passed through as None to the whisper pipeline.
-    language: str = "russian"
 
     # "auto" -> cuda:0 if available else cpu.
     device: str = "auto"
@@ -75,6 +67,29 @@ class VADSettings(_Base):
     silence_timeout: float = 0.8
     # Cap on a single segment length; long monologues are split at this bound.
     max_duration: float = 60.0
+
+
+class LLMSettings(_Base):
+    model_config = SettingsConfigDict(
+        env_prefix="LLM_", env_file=".env", extra="ignore"
+    )
+
+    # OpenAI-compatible endpoint. `url` becomes the openai client `base_url`,
+    # so it must include the /v1 suffix if the server expects one.
+    url: str = "http://localhost:8080/v1"
+    api_key: str = "not-needed"
+    model: str = "local-model"
+
+    # Map-reduce tunables. chunk_chars is the character budget per map chunk;
+    # chunk_overlap keeps context across chunk boundaries. Sizes are in
+    # characters (not tokens) — offline/CPU-friendly, no tokenizer needed.
+    chunk_chars: int = 8000
+    chunk_overlap: int = 400
+    temperature: float = 0.3
+    # Upper bound on the model's response length per LLM call.
+    max_tokens: int = 16384
+    # Per-request timeout in seconds (whole call, incl. retries by the client).
+    request_timeout: float = 120.0
 
 
 class SessionSettings(_Base):
@@ -100,6 +115,7 @@ class Config:
         self.stt = STTSettings()
         self.vad = VADSettings()
         self.session = SessionSettings()
+        self.llm = LLMSettings()
 
 
 def load_config() -> Config:

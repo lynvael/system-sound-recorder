@@ -1,1 +1,1 @@
-"""Speech-to-text engines (whisper / GigaAM) behind a common interface."""
+"""Speech-to-text engine (GigaAM) behind a common interface."""

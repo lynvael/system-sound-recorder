@@ -29,16 +29,13 @@ import sys
 import threading
 from pathlib import Path
 
-from app.config import Config, load_config
+from app.config import load_config
 from app.log import get_logger
 from app.log import setup as setup_logging
 from app.pipeline.session import Session
 from app.pipeline.transcript import Segment
 
 logger = get_logger("cli")
-
-_LANGUAGES = ("russian", "english", "auto")
-_ENGINES = ("whisper", "gigaam")
 
 
 def _fmt_clock(seconds: float) -> str:
@@ -97,16 +94,6 @@ class _SessionRunner:
         self.done.set()
 
 
-def _apply_stt_overrides(config: Config, engine: str, language: str) -> None:
-    """Mutate config before constructing Session, exactly like the GUI worker.
-
-    ``"auto"`` maps to ``None`` for the whisper pipeline (verbatim with
-    SessionWorker.start_session).
-    """
-    config.stt.engine = engine
-    config.stt.language = None if language == "auto" else language
-
-
 # --- list-devices ----------------------------------------------------------
 def _cmd_list_devices(args: argparse.Namespace) -> int:
     # Imported lazily so `list-devices` failures don't block `--help` and so the
@@ -130,7 +117,6 @@ def _cmd_transcribe(args: argparse.Namespace) -> int:
         return 1
 
     config = load_config()
-    _apply_stt_overrides(config, args.engine, args.language)
     config.session.mode = "file"
     if args.output_dir:
         config.session.output_dir = args.output_dir
@@ -176,7 +162,6 @@ def _cmd_transcribe(args: argparse.Namespace) -> int:
 # --- record ----------------------------------------------------------------
 def _cmd_record(args: argparse.Namespace) -> int:
     config = load_config()
-    _apply_stt_overrides(config, args.engine, args.language)
     config.session.mode = args.mode
     if args.output_dir:
         config.session.output_dir = args.output_dir
@@ -245,19 +230,6 @@ def build_parser() -> argparse.ArgumentParser:
     )
     p_tr.add_argument("file", help="Path to an audio/WAV file to transcribe.")
     p_tr.add_argument(
-        "--engine",
-        choices=_ENGINES,
-        default="whisper",
-        help="STT engine (default: whisper).",
-    )
-    p_tr.add_argument(
-        "--language",
-        choices=_LANGUAGES,
-        default="auto",
-        help="Language for whisper; 'auto' detects (GigaAM is Russian-only). "
-        "Default: auto.",
-    )
-    p_tr.add_argument(
         "--output-dir",
         default=None,
         help="Where session dirs are written (default: config session.output_dir).",
@@ -283,12 +255,6 @@ def build_parser() -> argparse.ArgumentParser:
         default="batch",
         help="live = stream+transcribe as you go; batch = transcribe on stop. "
         "Default: batch.",
-    )
-    p_rec.add_argument(
-        "--engine", choices=_ENGINES, default="whisper", help="STT engine."
-    )
-    p_rec.add_argument(
-        "--language", choices=_LANGUAGES, default="auto", help="Language."
     )
     p_rec.add_argument(
         "--output-dir",

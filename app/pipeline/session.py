@@ -28,10 +28,12 @@ Modes:
   - "batch": during the session only session.wav is streamed to disk. On stop(),
              both tracks are re-read from disk in blocks (wav_source, channel
              0/1) through two VADs -> full "Я"/"Собеседники" attribution.
-  - "file":  import a file. A 2-channel file is treated as our stereo session
-             (full attribution, like batch). A mono/other file is processed as a
-             single channel with a neutral speaker label (diarization is out of
-             scope). Resampled to the target rate on import if needed.
+  - "file":  import a file. ALWAYS transcribed as a single speaker (the neutral
+             label, config default "Speaker") regardless of channel count — no
+             stereo split, no channel attribution, no correlation detection.
+             Multi-channel files are downmixed to mono. Resampled to the target
+             rate on import if needed. (Dual "Я"/"Собеседники" attribution is
+             reserved for genuine live-recorded session.wav in batch mode.)
 
 batch and file share `_run_disk_pass`.
 
@@ -47,9 +49,12 @@ from __future__ import annotations
 
 import itertools
 import queue
+import re
 import threading
+import unicodedata
 from datetime import datetime
 from pathlib import Path
+from typing import Optional
 
 from app.audio import wav_source
 from app.audio.capture import DEFAULT_NATIVE_RATE, CaptureThread
@@ -72,6 +77,85 @@ _JOIN_TIMEOUT = 5.0
 
 _SENTINEL = object()
 
+# Max length (chars) of the sanitized user name portion of a session folder.
+# The full folder name is "<timestamp>_<sanitized>", so the timestamp prefix
+# (15 chars) plus this cap keeps the segment well under Windows' per-component
+# limit (255) and leaves plenty of headroom for the parent output_dir path.
+_MAX_NAME_LEN = 80
+
+# Chars illegal in a Windows path SEGMENT. Besides the path separators / and \,
+# Windows reserves < > : " | ? *. We strip these rather than substitute so a
+# name like "a/b" collapses cleanly instead of leaving stray placeholder glyphs.
+# Control/format chars (ASCII controls, DEL, C1, zero-width/bidi) are handled
+# separately below via a unicodedata category filter -- see
+# _sanitize_session_name -- so they are intentionally NOT listed here. Unicode
+# letters/digits (incl. Cyrillic) are deliberately NOT touched -- users name
+# sessions in Russian.
+_UNSAFE_CHARS = re.compile(r'[<>:"/\\|?*]')
+
+# Runs of any whitespace (spaces, tabs, newlines) collapse to a single "_" so
+# the folder name has no internal spaces -- easier to type in a shell / less
+# ambiguous in logs. (Chosen over collapsing to a single space; see report.)
+_WHITESPACE_RUN = re.compile(r"\s+")
+
+# Windows reserved device names (case-insensitive, with or without extension).
+# A folder literally named e.g. "CON" or "nul" is unusable, so we suffix a
+# sanitized result that matches one of these.
+_RESERVED_NAMES = {
+    "CON", "PRN", "AUX", "NUL",
+    *(f"COM{i}" for i in range(1, 10)),
+    *(f"LPT{i}" for i in range(1, 10)),
+}
+
+
+def _sanitize_session_name(raw: Optional[str]) -> Optional[str]:
+    """Turn raw user text into a safe Windows folder-name segment.
+
+    Returns the sanitized segment, or None when the input is empty/None/
+    whitespace-only OR when sanitization reduces it to nothing -- in which case
+    the caller falls back to the timestamp-only folder name (today's behavior).
+
+    Preserves Unicode letters/digits (Cyrillic included); only strips/collapses
+    characters that are unsafe or awkward in a Windows path component.
+    """
+    if raw is None:
+        return None
+    # Drop chars illegal in a Windows path segment.
+    cleaned = _UNSAFE_CHARS.sub("", raw)
+    # Drop invisible/dangerous control and format characters the regex above
+    # does not cover: ASCII C0 controls and DEL (0x7F), the C1 controls
+    # (0x80-0x9F), and Unicode format chars such as the zero-width space
+    # (U+200B) and bidi overrides (e.g. U+202E RIGHT-TO-LEFT OVERRIDE, which can
+    # spoof how a folder name renders). unicodedata categories Cc (control) and
+    # Cf (format) capture ALL of these while leaving Cyrillic and other real
+    # letters/digits (categories L*/N*) untouched.
+    cleaned = "".join(
+        ch for ch in cleaned if unicodedata.category(ch) not in ("Cc", "Cf")
+    )
+    # Collapse whitespace runs to single underscores.
+    cleaned = _WHITESPACE_RUN.sub("_", cleaned)
+    # Windows silently trims trailing dots/spaces from path segments, which can
+    # turn a name into something unexpected (or empty); strip them from both
+    # ends. Also strip underscores we may have introduced at the edges.
+    cleaned = cleaned.strip(" ._")
+    if not cleaned:
+        return None
+    # Cap length before the reserved-name check so a truncation can't re-create
+    # a reserved name at the boundary.
+    cleaned = cleaned[:_MAX_NAME_LEN].strip(" ._")
+    if not cleaned:
+        return None
+    # A folder named after a DOS device is unusable. Windows matches the reserved
+    # set against the STEM -- the portion before the FIRST dot -- so "CON.txt" is
+    # just as reserved as "CON". Suffix the underscore onto the stem (not the
+    # whole string) so the mangled name's stem no longer matches: "CON.txt" ->
+    # "CON_.txt", "CON" -> "CON_". Splitting on the first "." preserves any
+    # remainder verbatim.
+    stem, dot, remainder = cleaned.partition(".")
+    if stem.upper() in _RESERVED_NAMES:
+        cleaned = f"{stem}_{dot}{remainder}"
+    return cleaned
+
 
 class Session:
     def __init__(
@@ -82,6 +166,7 @@ class Session:
         mic_id=None,
         loopback_id=None,
         import_path=None,
+        name: Optional[str] = None,
         on_segment=None,
         on_status=None,
         on_backlog=None,
@@ -107,13 +192,22 @@ class Session:
         self.mic_label = config.capture.mic_label
         self.loop_label = config.capture.loopback_label
         self.neutral_label = config.capture.neutral_label
-        self.language = config.stt.language
 
         # Session directory (created at start). session.wav lives here for
         # live/batch; for file the import stays where it is.
-        self.session_dir = Path(config.session.output_dir) / (
-            datetime.now().strftime("%Y%m%d_%H%M%S")
-        )
+        #
+        # Folder name: a timestamp, optionally suffixed with a sanitized user
+        # name. With no (usable) name we keep the historical timestamp-only
+        # name verbatim. With a name we prefix the timestamp so sessions stay
+        # sortable AND collision-safe across seconds -- the picker sorts folder
+        # names descending, so timestamp-first keeps chronological order
+        # regardless of the name. (Two sessions started within the same 1-second
+        # timestamp with the same/no name can still collide; this is pre-existing
+        # behavior and out of scope here.)
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        safe_name = _sanitize_session_name(name)
+        dir_name = f"{timestamp}_{safe_name}" if safe_name else timestamp
+        self.session_dir = Path(config.session.output_dir) / dir_name
         self.wav_path = self.session_dir / "session.wav"
         # Per-channel mono outputs (live/batch). Derived in lockstep from the
         # same aligned blocks as session.wav, so they stay sample-for-sample
@@ -269,7 +363,7 @@ class Session:
             self._attempted += 1
             try:
                 with self._infer_lock:
-                    text = self._engine.transcribe(raw.audio, self.language)
+                    text = self._engine.transcribe(raw.audio)
             except Exception as exc:  # keep the queue moving (non-terminal)
                 # A single segment failing to transcribe is recoverable: the STT
                 # worker keeps running. Report via the non-terminal status channel
@@ -575,16 +669,24 @@ class Session:
             self._emit_error("Не указан файл для импорта")
             raise ValueError("Не указан файл для импорта")
         try:
-            info = wav_source.read_info(self.import_path)
+            # Validate the file is openable before spawning the pass; the
+            # channel count no longer matters (imports are always mono/neutral).
+            wav_source.read_info(self.import_path)
         except Exception as exc:
             # Same contract: surface the error, then re-raise so start()
             # propagates and the worker resets instead of staying wedged.
             self._emit_error(f"Не удалось открыть файл: {exc}")
             raise RuntimeError(f"Не удалось открыть файл: {exc}") from exc
-        stereo = info.channels == 2  # our session format -> full attribution
+        # An imported file is ALWAYS transcribed as a single speaker (the neutral
+        # "Speaker" label) via the mono disk pass, regardless of channel count. We
+        # do not split stereo, attribute channels, or detect correlation for
+        # imports — dual "Я"/"Собеседники" attribution is reserved for genuine
+        # live-recorded session.wav (batch mode). iter_blocks(channel=None)
+        # downmixes any multi-channel file to mono. read_info above still runs to
+        # validate the file is openable before we spawn the pass.
         self._disk_thread = threading.Thread(
             target=self._run_disk_pass,
-            args=(self.import_path, stereo),
+            args=(self.import_path, False),
             name="file-pass",
             daemon=True,
         )

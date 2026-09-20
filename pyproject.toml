@@ -2,7 +2,7 @@
 name = "live-recorder"
 version = "0.1.0"
 description = "Live meeting transcription: microphone + system audio (loopback), Silero VAD + switchable STT (whisper / GigaAM)."
-readme = "kind-hatching-allen.md"
+readme = "README.md"
 requires-python = ">=3.12"
 dependencies = [
     # Pinned to keep whisper and GigaAM-v3 in one environment without conflict.
@@ -20,6 +20,10 @@ dependencies = [
     "pydantic-settings",
     "python-dotenv",
     "PySide6",
+    # On-demand meeting summarization (app/summarize): OpenAI-compatible LLM
+    # client for the map-reduce pipeline, python-docx for the .docx export.
+    "openai",
+    "python-docx",
 ]
 
 [project.optional-dependencies]
