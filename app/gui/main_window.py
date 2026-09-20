@@ -22,6 +22,7 @@ from PySide6.QtCore import QThread, QTimer, QUrl, Signal
 from PySide6.QtGui import QDesktopServices, QTextCursor
 from PySide6.QtWidgets import (
     QApplication,
+    QCheckBox,
     QComboBox,
     QFileDialog,
     QGridLayout,
@@ -178,6 +179,11 @@ class MainWindow(QMainWindow):
         self.loopback_combo = QComboBox(controls_group)
         self.model_combo = QComboBox(controls_group)
         self.mode_combo = QComboBox(controls_group)
+        # Live/batch only: unchecking skips the mic ("Я") capture entirely
+        # (silence-padded channel) so a mic that just echoes the system audio
+        # played through the speakers can't duplicate the transcription.
+        self.mic_check = QCheckBox("Записывать микрофон", controls_group)
+        self.mic_check.setChecked(True)
 
         for label, value in MODEL_ITEMS:
             self.model_combo.addItem(label, value)
@@ -186,16 +192,17 @@ class MainWindow(QMainWindow):
 
         grid.addWidget(QLabel("Микрофон:"), 0, 0)
         grid.addWidget(self.mic_combo, 0, 1)
-        grid.addWidget(QLabel("Системный звук:"), 1, 0)
-        grid.addWidget(self.loopback_combo, 1, 1)
-        grid.addWidget(QLabel("Модель:"), 2, 0)
-        grid.addWidget(self.model_combo, 2, 1)
+        grid.addWidget(self.mic_check, 1, 1, 1, 2)
+        grid.addWidget(QLabel("Системный звук:"), 2, 0)
+        grid.addWidget(self.loopback_combo, 2, 1)
+        grid.addWidget(QLabel("Модель:"), 3, 0)
+        grid.addWidget(self.model_combo, 3, 1)
         grid.addWidget(QLabel("Режим:"), 0, 2)
         grid.addWidget(self.mode_combo, 0, 3)
 
         self.open_file_button = QPushButton("Открыть аудиофайл…", controls_group)
         self.open_file_button.setEnabled(False)
-        grid.addWidget(self.open_file_button, 2, 2, 1, 1)
+        grid.addWidget(self.open_file_button, 3, 2, 1, 1)
 
         # Persistent (non-transient) indicator of the file picked in File
         # mode -- unlike the status-bar message this used to rely on, it
@@ -203,14 +210,14 @@ class MainWindow(QMainWindow):
         # File mode; see `_update_mode_dependent_widgets`.
         self._import_file_label = QLabel("Файл не выбран", controls_group)
         self._import_file_label.setStyleSheet("color: #5f6368;")
-        grid.addWidget(self._import_file_label, 2, 3, 1, 1)
+        grid.addWidget(self._import_file_label, 3, 3, 1, 1)
 
         self.session_name_edit = QLineEdit(controls_group)
         self.session_name_edit.setPlaceholderText(
-            "необязательно — по умолчанию дата/время"
+            "необязательно — дата/время"
         )
-        grid.addWidget(QLabel("Название сеанса:"), 3, 0)
-        grid.addWidget(self.session_name_edit, 3, 1, 1, 3)
+        grid.addWidget(QLabel("Название сеанса:"), 4, 0)
+        grid.addWidget(self.session_name_edit, 4, 1, 1, 3)
 
         root.addWidget(controls_group)
 
@@ -255,6 +262,7 @@ class MainWindow(QMainWindow):
         self.statusBar().showMessage("Готово")
 
         self.mode_combo.currentIndexChanged.connect(self._update_mode_dependent_widgets)
+        self.mic_check.toggled.connect(self._update_mode_dependent_widgets)
         self.open_file_button.clicked.connect(self._on_open_file_clicked)
         self.start_button.clicked.connect(self._on_start_clicked)
         self.stop_button.clicked.connect(self._on_stop_clicked)
@@ -416,7 +424,10 @@ class MainWindow(QMainWindow):
     def _update_mode_dependent_widgets(self) -> None:
         is_file_mode = self._current_mode() == "file"
         self.open_file_button.setEnabled(is_file_mode)
-        self.mic_combo.setEnabled(not is_file_mode)
+        # The mic selector is usable only in live/batch AND only while the mic
+        # channel is actually being recorded.
+        self.mic_combo.setEnabled(not is_file_mode and self.mic_check.isChecked())
+        self.mic_check.setEnabled(not is_file_mode)
         self.loopback_combo.setEnabled(not is_file_mode)
         # Only relevant in File mode -- hide it in live/batch so it doesn't
         # clutter the controls grid with a label nobody can act on there.
@@ -698,6 +709,7 @@ class MainWindow(QMainWindow):
             import_path=self._import_path if mode == "file" else None,
             engine=self.model_combo.currentData(),
             session_name=session_name,
+            record_mic=self.mic_check.isChecked(),
         )
 
         self.transcript_view.clear()

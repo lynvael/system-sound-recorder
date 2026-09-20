@@ -91,6 +91,52 @@ segmenter, `app/common/{config,log}.py`).
   `_is_stopped`. (AlignedRecorder's `self._stop` Event is fine — it is NOT a Thread
   subclass, it runs a separate `threading.Thread(target=self._run)`.) This class of bug
   is invisible to compile/import checks — only shows at runtime when join() is called.
+- **`soundcard.get_microphone(id, include_loopback=True)` does FUZZY id matching** and
+  will silently fall back to a LOOPBACK endpoint when a mic id no longer resolves exactly
+  (e.g. mic physically unplugged). `_match_device` tries exact-id → name-substring → regex
+  fuzzy; `all_microphones(include_loopback=True)` lists loopbacks first, so a disconnected
+  mic resolved to a system-audio endpoint. Result: the mic ("Я") channel captured the SAME
+  system audio as the loopback ("Собеседники") channel → EVERY utterance transcribed twice
+  (duplicated live replicas). Fix (in `app/audio/capture.py`): `CaptureThread` takes a
+  required `expect_loopback` bool; `_resolve_device` passes it as `include_loopback` (mic=
+  False so a loopback can't even be a candidate) AND validates the resolved device — exact
+  `device.id == requested id` (rejects any fuzzy fallback) and `device.isloopback ==
+  expect_loopback` — raising a Russian error. `_start_captures` passes
+  `expect_loopback=[False, True]` for `[mic, loopback]`. Do NOT "solve" this class of
+  duplication with content/correlation dedup (deliberately removed — see file-mode note
+  above); fix device resolution at the source.
+- **Capture-device failure is PARTIAL-tolerant** (see `Session._handle_capture_errors`,
+  `_abort_if_all_captures_failed_at_start`). A capture thread that can't resolve its device
+  sets `.error` and exits WITHOUT setting `.resolved`, but still emits
+  its `None` sentinel in `finally`, so feeders/segmenters drain and AlignedRecorder
+  silence-pads the dead channel and the SURVIVING channel records cleanly. Policy: a SINGLE
+  dead channel is NON-TERMINAL — a Russian on_status warning names the channel («Я» mic /
+  «Собеседники» loopback) and the session finishes on the other channel's transcript. Only
+  when EVERY capture channel failed is it terminal on_error (per the on_error=TERMINAL
+  contract). All-dead is normally caught FAST at start: after `ct.start()`,
+  `_abort_if_all_captures_failed_at_start` polls up to `_START_RESOLVE_TIMEOUT` (3s) — any
+  channel setting `CaptureThread.resolved` short-circuits the wait (normal start is instant),
+  but if every thread already errored it RAISES (start-time-failures-RAISE contract → GUI
+  worker resets) instead of recording hours of silence. `_handle_capture_errors` (called in
+  `_stop_live`/`_stop_batch`) is the stop-time safety net for channels that resolved OK at
+  start but died mid-run.
+- **The user's live "system-audio duplicated" symptom is ACOUSTIC ECHO, not the device bug.**
+  In the user's setup the Realtek mic picks up system audio played through the monitor
+  speakers (GM27-CFX). Evidence (cross-correlation of mic.wav vs loopback.wav, 2026-09-20
+  sessions): mic channel ≈ loopback delayed ~31 ms (consistent +30/+33/+31 ms across
+  sessions), ~8x lower level, 0.98 corr in speech windows; mic channel ALSO contains the
+  user's own voice (so it is the real mic, not a loopback endpoint). VAD segments the echo
+  and GigaAM transcribes it → others' phrases appear twice («Собеседники» + «Я»). The
+  fuzzy-fallback fix above is NOT the cause of these sessions. User's "mic off" (method
+  unknown) did NOT silence the OS capture — the 21:05 session still carries the echo.
+  Fix implemented (2026-09-20): GUI checkbox «Записывать микрофон» (default on) →
+  `SessionParams.record_mic` → `Session(record_mic=...)`; CLI: `record --no-mic`
+  (then `--mic-id` optional). When off the mic capture+feeder are simply not
+  started; AlignedRecorder silence-pads the left channel, so transcript is
+  loopback-only and mic.wav is silent. Verified with a live test session.
+  Segment-level echo gating (skip «Я» segments highly correlated with loopback
+  audio in the same window; user's own speech is uncorrelated and survives)
+  remains a future option if the user wants mic ON without echo.
 - **`silero-vad==6.2.2` imports `onnxruntime` at package import but doesn't declare it** —
   `onnxruntime` is in base deps for this reason. Don't remove it.
 - **Native capture rate is assumed 48000 Hz** (`soundcard` needs an explicit samplerate

@@ -31,12 +31,16 @@ def list_loopbacks() -> list[tuple[str, str]]:
     ]
 
 
-def get_microphone(device_id: str):
+def get_microphone(device_id: str, *, include_loopback: bool = False):
     """Resolve a soundcard microphone/loopback object by its id.
 
-    `include_loopback=True` so loopback ids resolve too. Raises if not found.
+    `include_loopback` MUST match the endpoint kind you expect: pass True only
+    when resolving a system-audio (loopback) id, and leave it False for a real
+    microphone. Passing True for a mic makes soundcard's fuzzy id fallback able
+    to resolve onto a loopback endpoint (see `app/audio/capture._resolve_device`
+    for why that duplicated the transcription). Raises if not found.
     """
-    return sc.get_microphone(device_id, include_loopback=True)
+    return sc.get_microphone(device_id, include_loopback=include_loopback)
 
 
 def _main() -> None:

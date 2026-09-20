@@ -91,6 +91,9 @@ class SessionParams:
     # it into the output folder name, or falls back to a timestamp-only folder
     # when it's unusable. The GUI does no validation of its own.
     session_name: Optional[str] = None
+    # Live/batch only: when False the mic ("Я") channel is not captured at all
+    # (silence-padded); the transcript then contains only the loopback channel.
+    record_mic: bool = True
 
 
 class SessionWorker(QObject):
@@ -141,6 +144,7 @@ class SessionWorker(QObject):
                 loopback_id=params.loopback_id,
                 import_path=params.import_path,
                 name=params.session_name,
+                record_mic=params.record_mic,
                 on_segment=self._emit_segment,
                 on_status=self.status_changed.emit,
                 on_backlog=self.backlog_changed.emit,

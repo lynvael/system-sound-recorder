@@ -5,6 +5,7 @@ SHARED INTERFACE CONTRACT (the GUI is built against this — keep it stable):
     class Session:
         def __init__(self, config, mode: str, *,
                      mic_id=None, loopback_id=None, import_path=None,
+                     record_mic=True,      # live/batch: False => no mic capture
                      on_segment=None,      # Callable[[Segment], None]
                      on_status=None,       # Callable[[str], None]
                      on_backlog=None,      # Callable[[int], None]  STT queue depth
@@ -25,6 +26,8 @@ Modes:
              AND forwards aligned per-channel blocks to two ContinuousSegmenters
              (each in its own thread); finalized segments go to a single FIFO
              transcription queue, transcribed by one worker as they are ready.
+             `record_mic=False` skips the mic capture (left channel
+             silence-padded) so the transcript contains loopback only.
   - "batch": during the session only session.wav is streamed to disk. On stop(),
              both tracks are re-read from disk in blocks (wav_source, channel
              0/1) through two VADs -> full "Я"/"Собеседники" attribution.
@@ -51,6 +54,7 @@ import itertools
 import queue
 import re
 import threading
+import time
 import unicodedata
 from datetime import datetime
 from pathlib import Path
@@ -74,6 +78,15 @@ _DISK_BLOCKSIZE = 4096
 # soundcard.record() (e.g. loopback blocking on system silence) can otherwise
 # hang teardown indefinitely; we log and abandon the thread instead.
 _JOIN_TIMEOUT = 5.0
+
+# Bounded window (seconds) after starting captures to detect an all-devices-dead
+# start. Capture threads resolve their device as the very first thing run() does:
+# a bad id errors and exits within milliseconds; a good one sets `.resolved` and
+# keeps recording. We poll this window so an all-dead start fails FAST (raises,
+# per the start-time-failures-RAISE contract) instead of "recording" hours of
+# silence. A single live channel short-circuits the wait, so a normal start with
+# working devices returns almost immediately.
+_START_RESOLVE_TIMEOUT = 3.0
 
 _SENTINEL = object()
 
@@ -167,6 +180,7 @@ class Session:
         loopback_id=None,
         import_path=None,
         name: Optional[str] = None,
+        record_mic: bool = True,
         on_segment=None,
         on_status=None,
         on_backlog=None,
@@ -180,6 +194,12 @@ class Session:
         self.mic_id = mic_id
         self.loopback_id = loopback_id
         self.import_path = Path(import_path) if import_path else None
+        # Live/batch only: when False the mic ("Я") capture is not started at
+        # all — AlignedRecorder silence-pads the left channel, so the
+        # transcript contains only the loopback channel. This is the app-level
+        # "mic off" for setups where the mic just echoes the system audio
+        # played through the speakers (no system settings involved).
+        self.record_mic = record_mic
 
         self.on_segment = on_segment
         self.on_status = on_status
@@ -457,14 +477,26 @@ class Session:
         submits = [self._recorder.submit_left, self._recorder.submit_right]
         device_ids = [self.mic_id, self.loopback_id]
         names = ["capture-mic", "capture-loop"]
-        for dev_id, cap_q, submit, name in zip(
-            device_ids, self._cap_queues, submits, names
+        # The mic channel must NEVER open a loopback endpoint (that would capture
+        # system audio and duplicate the loopback channel); the loopback channel
+        # is genuinely a WASAPI loopback. This flag both selects include_loopback
+        # for id resolution AND is validated against the resolved device.
+        expect_loopbacks = [False, True]
+        # record_mic=False: the mic capture+feeder are simply not started. The
+        # left channel stays empty, AlignedRecorder silence-pads it, and the mic
+        # segmenter finds no speech — the transcript gets loopback only.
+        enabled = [self.record_mic, True]
+        for dev_id, cap_q, submit, name, expect_loopback, is_enabled in zip(
+            device_ids, self._cap_queues, submits, names, expect_loopbacks, enabled
         ):
+            if not is_enabled:
+                continue
             ct = CaptureThread(
                 dev_id,
                 cap_q,
                 frame_size=self.frame_size,
                 target_sample_rate=self.rate,
+                expect_loopback=expect_loopback,
                 native_sample_rate=DEFAULT_NATIVE_RATE,
                 chunk_frames=self.config.capture.chunk_frames,
                 name=name,
@@ -485,7 +517,7 @@ class Session:
         silent, empty session; raising here lets start() propagate a clear error
         to the GUI worker so it can reset.
         """
-        if self.mic_id is None:
+        if self.record_mic and self.mic_id is None:
             raise ValueError("Не выбрано устройство микрофона (mic_id)")
         if self.loopback_id is None:
             raise ValueError(
@@ -517,14 +549,79 @@ class Session:
                     _JOIN_TIMEOUT,
                 )
 
-    def _surface_capture_errors(self) -> bool:
-        """Report any capture-thread exception via on_error. Returns True if any."""
-        had_error = False
-        for ct in self._captures:
-            if ct.error is not None:
-                had_error = True
-                self._emit_error(f"Ошибка захвата ({ct.name}): {ct.error}")
-        return had_error
+    def _capture_channel_label(self, ct: CaptureThread) -> str:
+        """User-facing name of a capture channel for status/error messages."""
+        if ct.expect_loopback:
+            return f"«{self.loop_label}» (системный звук)"
+        return f"«{self.mic_label}» (микрофон)"
+
+    def _handle_capture_errors(self) -> None:
+        """Apply the partial-vs-total capture-failure policy at stop time.
+
+        Per the on_error(TERMINAL)/on_status(non-terminal) contract:
+          * A SINGLE / partial capture failure is NON-TERMINAL. The surviving
+            channel recorded cleanly — the failed capture thread still emitted
+            its `None` sentinel in `finally`, so feeders/segmenters drained and
+            AlignedRecorder silence-padded the dead channel. We warn via
+            on_status naming the dead channel; the session finishes normally on
+            the other channel's transcript.
+          * Only when EVERY capture channel failed (nothing was captured at all)
+            is it terminal -> on_error, and the session ends as a failure.
+
+        This is the STOP-TIME safety net. The common all-dead case is caught
+        earlier and faster by `_abort_if_all_captures_failed_at_start` (which
+        raises during start); this still covers channels that resolved OK at
+        start but died mid-run.
+        """
+        errored = [ct for ct in self._captures if ct.error is not None]
+        if not errored:
+            return
+        if len(errored) == len(self._captures):
+            details = "; ".join(
+                f"{self._capture_channel_label(ct)}: {ct.error}" for ct in errored
+            )
+            self._emit_error(
+                "Ни одно устройство захвата не удалось открыть — запись пуста. "
+                f"{details}"
+            )
+            return
+        # Partial failure: the other channel is fine. Non-terminal warning only.
+        for ct in errored:
+            self._set_status(
+                f"Канал {self._capture_channel_label(ct)} недоступен — этот "
+                f"канал останется пустым: {ct.error}"
+            )
+
+    def _abort_if_all_captures_failed_at_start(self) -> None:
+        """Fail fast during start() when EVERY capture device is unresolvable.
+
+        Poll the just-started capture threads for a bounded window. As soon as
+        ANY channel resolves its device (`.resolved` set) the start is not
+        all-dead and we return — a single working device is enough to run the
+        session (the dead channel is handled non-terminally at stop). If instead
+        every thread has already errored out, we RAISE so start() propagates and
+        the GUI worker resets (start-time-failures-RAISE contract), rather than
+        recording silence for the whole session.
+        """
+        waited = 0.0
+        poll = 0.05
+        while waited < _START_RESOLVE_TIMEOUT:
+            if any(ct.resolved.is_set() for ct in self._captures):
+                return  # at least one live channel -> not an all-dead start
+            if self._captures and all(
+                ct.error is not None for ct in self._captures
+            ):
+                break  # every thread already failed to resolve
+            time.sleep(poll)
+            waited += poll
+        if self._captures and all(ct.error is not None for ct in self._captures):
+            details = "; ".join(
+                f"{self._capture_channel_label(ct)}: {ct.error}"
+                for ct in self._captures
+            )
+            raise RuntimeError(
+                "Ни одно устройство захвата не удалось открыть: " + details
+            )
 
     def _abort_startup(self) -> None:
         """Best-effort teardown of anything opened by a failed start().
@@ -589,6 +686,9 @@ class Session:
                 ct.start()
             for f in self._feeders:
                 f.start()
+            # Fast-fail only when EVERY device is dead; a single dead channel is
+            # tolerated (handled non-terminally at stop).
+            self._abort_if_all_captures_failed_at_start()
         except Exception as exc:
             # Clean up any partially opened threads/handles, then propagate.
             self._emit_error(f"Не удалось запустить запись: {exc}")
@@ -601,7 +701,9 @@ class Session:
         for ct in self._captures:
             ct.stop()
         self._join_captures_and_feeders()
-        capture_failed = self._surface_capture_errors()
+        # Partial capture failure is non-terminal (warns via on_status); only an
+        # all-channels-dead capture is terminal here.
+        self._handle_capture_errors()
         if self._recorder is not None:
             self._recorder.stop()  # final drain -> forwards last aligned blocks
         # Signal segmenters end (after all aligned blocks were forwarded).
@@ -617,10 +719,6 @@ class Session:
                 )
         self._set_status("Завершение транскрипции…")
         self._stop_worker()
-        if capture_failed:
-            self._emit_error(
-                "Запись завершена с ошибкой захвата — результат может быть неполным."
-            )
         self._emit_systemic_failure_if_all_failed()
         self._finish()
 
@@ -635,6 +733,9 @@ class Session:
                 ct.start()
             for f in self._feeders:
                 f.start()
+            # Fast-fail only when EVERY device is dead; a single dead channel is
+            # tolerated (handled non-terminally at stop).
+            self._abort_if_all_captures_failed_at_start()
         except Exception as exc:
             self._emit_error(f"Не удалось запустить запись: {exc}")
             self._abort_startup()
@@ -646,14 +747,12 @@ class Session:
         for ct in self._captures:
             ct.stop()
         self._join_captures_and_feeders()
-        capture_failed = self._surface_capture_errors()
+        # Partial capture failure is non-terminal (warns via on_status); only an
+        # all-channels-dead capture is terminal here.
+        self._handle_capture_errors()
         if self._recorder is not None:
             self._recorder.stop()
-        if capture_failed:
-            self._emit_error(
-                "Запись завершена с ошибкой захвата — расшифровка может быть неполной."
-            )
-        # Now transcribe both tracks from disk.
+        # Now transcribe both tracks from disk (the surviving channel, if any).
         self._run_disk_pass(self.wav_path, stereo=True)
 
     # --- file (import) -----------------------------------------------------

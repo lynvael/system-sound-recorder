@@ -161,6 +161,10 @@ def _cmd_transcribe(args: argparse.Namespace) -> int:
 
 # --- record ----------------------------------------------------------------
 def _cmd_record(args: argparse.Namespace) -> int:
+    if not args.no_mic and not args.mic_id:
+        print("[ошибка] Нужен --mic-id (или --no-mic, чтобы не записывать микрофон).",
+              file=sys.stderr)
+        return 2
     config = load_config()
     config.session.mode = args.mode
     if args.output_dir:
@@ -172,6 +176,7 @@ def _cmd_record(args: argparse.Namespace) -> int:
         args.mode,
         mic_id=args.mic_id,
         loopback_id=args.loopback_id,
+        record_mic=not args.no_mic,
         on_segment=runner.on_segment,
         on_status=runner.on_status,
         on_backlog=runner.on_backlog,
@@ -241,8 +246,14 @@ def build_parser() -> argparse.ArgumentParser:
     )
     p_rec.add_argument(
         "--mic-id",
-        required=True,
-        help="Microphone device id (from `list-devices`).",
+        default=None,
+        help="Microphone device id (from `list-devices`). Required unless "
+        "--no-mic is given.",
+    )
+    p_rec.add_argument(
+        "--no-mic",
+        action="store_true",
+        help="Do not capture the mic channel (loopback only).",
     )
     p_rec.add_argument(
         "--loopback-id",
