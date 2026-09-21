@@ -46,18 +46,20 @@ from PySide6.QtWidgets import (
 # and is expected to return List[Tuple[str, Any]] (name, id) pairs for both
 # helpers.
 #
-# NOTE(COM apartment ordering): both `app.audio.devices` (directly) and
-# `app.gui.worker` (transitively, via app.pipeline.session -> app.audio.capture)
-# do `import soundcard` at module load time, and soundcard's mediafoundation
-# backend runs `CoInitializeEx` on the importing thread the first time the
-# module is imported. If either import happens while this module
-# (`app.gui.main_window`) itself is being imported -- i.e. before `main()`
-# has constructed the `QApplication` -- soundcard claims the main thread's COM
-# apartment (MTA) before Qt gets a chance to, and Qt's Windows platform plugin
-# then fails with "OleInitialize() failed: RPC_E_CHANGED_MODE" because it
-# requires STA. Both imports are therefore deferred (see `_populate_devices`
-# and `MainWindow.__init__`/`_on_start_clicked` below) so they only run after
-# `QApplication` already exists and has put the main thread into STA.
+# NOTE(COM apartment ordering): the audio backend is PyAudioWPatch (a
+# PortAudio fork). Importing it does NOT touch COM -- the COM initialization
+# (`CoInitialize`, STA) happens when the `PyAudio()` instance is CREATED, and
+# that instance is a lazy module singleton in `app.audio.backend`
+# (`get_backend()`), created on first real use (device enumeration / capture
+# start), never at import time. PortAudio's STA apartment is compatible with
+# Qt (the previous backend claimed the main thread's COM apartment as MTA at
+# import time and used to lose the apartment race, crashing launch with
+# "OleInitialize() failed: RPC_E_CHANGED_MODE"). The lazy-import convention
+# is kept anyway: `app.audio.devices` (directly) and
+# `app.gui.worker` (transitively, via app.pipeline.session ->
+# app.audio.capture) are imported only inside `_populate_devices` and
+# `MainWindow.__init__`/`_on_start_clicked` below, so no audio code runs
+# before `main()` has constructed the `QApplication`.
 
 # Segment.speaker labels. TODO(reconcile-with-backend): the spec says speaker
 # labels come from config ("метки говорящих" in CaptureSettings) and default
@@ -123,8 +125,8 @@ class MainWindow(QMainWindow):
         self._summarizing_dir: Optional[Path] = None
         self._current_backlog = 0
 
-        # `app.config` does not import soundcard (unlike app.gui.worker /
-        # app.audio.devices), so it's safe to import at module scope -- but
+        # `app.config` does not touch the audio backend (unlike app.gui.worker
+        # / app.audio.devices), so it's safe to import at module scope -- but
         # kept as a local, best-effort import here in case the backend
         # config module isn't importable yet (mirrors the graceful
         # degradation used elsewhere in this file).
@@ -141,10 +143,12 @@ class MainWindow(QMainWindow):
         self._refresh_session_list()
 
         # Imported here (lazily), not at module load time: this pulls in
-        # app.pipeline.session -> app.audio.capture -> soundcard, which
-        # initializes COM on the importing thread -- see the
-        # COM-apartment-ordering note near the top of this module. `__init__`
-        # only runs after `main()` has already constructed `QApplication`.
+        # app.pipeline.session -> app.audio.capture -> app.audio.backend.
+        # The audio backend itself (the PyAudio() instance and with it the
+        # PortAudio COM init) is created lazily on first use, never at import
+        # time -- see the COM-apartment-ordering note near the top of this
+        # module. `__init__` only runs after `main()` has already constructed
+        # `QApplication`.
         from app.gui.worker import SessionWorker
 
         self._worker_thread = QThread(self)
@@ -369,11 +373,13 @@ class MainWindow(QMainWindow):
         # TODO(reconcile-with-backend): if app/audio/devices.py isn't built
         # yet, degrade gracefully instead of crashing the GUI at import time.
         #
-        # Imported here (lazily), not at module load time: `soundcard` (pulled
-        # in by app.audio.devices) initializes COM on whatever thread first
-        # imports it. This method only runs from `MainWindow.__init__`, which
-        # `main()` only calls after constructing `QApplication` -- see the
-        # COM-apartment-ordering note near the top of this module.
+        # Imported here (lazily), not at module load time: this is what
+        # eventually reaches the audio backend (app.audio.devices ->
+        # app.audio.backend), and the PyAudio() instance is created on first
+        # use -- which must be after `QApplication` exists. This method only
+        # runs from `MainWindow.__init__`, which `main()` only calls after
+        # constructing `QApplication` -- see the COM-apartment-ordering note
+        # near the top of this module.
         try:
             from app.audio.devices import list_loopbacks, list_microphones
         except Exception:  # pragma: no cover - backend module not available yet
@@ -389,13 +395,16 @@ class MainWindow(QMainWindow):
 
         if not mics:
             self.mic_combo.addItem("(микрофоны не найдены)", None)
-        for name, device_id in mics:
-            self.mic_combo.addItem(name, device_id)
+        for name, _device_id in mics:
+            # Device identity IS the name (PortAudio exports no stable
+            # endpoint id): the combo data must be the exact name, so
+            # capture resolution matches what `list-devices` prints.
+            self.mic_combo.addItem(name, name)
 
         if not loopbacks:
             self.loopback_combo.addItem("(системный звук не найден)", None)
-        for name, device_id in loopbacks:
-            self.loopback_combo.addItem(name, device_id)
+        for name, _device_id in loopbacks:
+            self.loopback_combo.addItem(name, name)
 
     # -- helpers ----------------------------------------------------------
 

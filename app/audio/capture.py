@@ -1,16 +1,24 @@
 """Live capture of a single device into exact target-rate mono frames.
 
-`CaptureThread` runs one background thread per device (one for the mic, one for
-the loopback). Each loop iteration:
-  1. pulls a native-rate block from `soundcard` (`recorder.record`),
-  2. downmixes to mono,
+`CaptureThread` runs one background thread per device (one for the mic, one
+for the loopback). Each loop iteration:
+  1. pulls a native-rate block from the PyAudioWPatch stream (`stream.read`),
+  2. decodes the float32 bytes and downmixes to mono,
   3. streaming-resamples native -> target rate (`StreamingResampler`),
   4. buffers into exact `frame_size`-sample frames using the `pending` pattern
      ported from Chisa's orchestrator/audio.go,
   5. pushes each frame onto an output queue.
 
+The stream is opened at the device's NATIVE rate (`defaultSampleRate`,
+fallback `DEFAULT_NATIVE_RATE`) in `paFloat32`, so WASAPI does no extra
+sample-rate conversion and soxr takes the audio to the target rate.
+
 The single, common timeline is owned by `AlignedRecorder` (which aligns both
 channels to a shared monotonic clock); individual frames are not timestamped.
+
+`pyaudiowpatch` is imported lazily (in `backend.get_backend()`, and inside
+`run()` for the `paFloat32` constant), so this module imports cleanly on
+non-Windows dev boxes where the package is not installed.
 """
 
 from __future__ import annotations
@@ -19,16 +27,18 @@ import queue
 import threading
 
 import numpy as np
-import soundcard as sc
 
+from app.audio import backend
+from app.audio.devices import get_device
 from app.audio.resample import StreamingResampler
 from app.log import get_logger
 
 logger = get_logger("capture")
 
-# WASAPI shared mode commonly runs at 48 kHz; used when a native rate isn't
-# otherwise known. soundcard honours the requested rate (resampling in the
-# driver if the device differs), and our soxr stage takes it to the target rate.
+# Fallback native rate, used only when a device's `defaultSampleRate` is
+# missing or <= 0. WASAPI shared mode commonly runs at 48 kHz; the device's
+# own mix-format rate is preferred (read in run() after resolution) so the
+# driver does no extra SRC.
 DEFAULT_NATIVE_RATE = 48000
 
 
@@ -42,63 +52,58 @@ def _downmix_mono(block: np.ndarray) -> np.ndarray:
     return block.mean(axis=1).astype(np.float32)
 
 
-def _resolve_device(device_id: str, expect_loopback: bool):
-    """Resolve a soundcard device by id and VALIDATE it is the endpoint we asked.
+def _pa_phrase(code: int) -> str | None:
+    """Short Russian phrase for a PortAudio error code (None if unmapped).
 
-    This guards against soundcard's FUZZY id resolution silently opening the
-    WRONG endpoint. `soundcard.get_microphone(id, include_loopback=...)` (see
-    mediafoundation.py `_match_device`) tries, in order: exact id match, then a
-    NAME-substring match (`id in name`), then a FUZZY match (`re.match` of the id
-    with `.*` between every character). If a device's exact id no longer resolves
-    — e.g. the physical microphone is unplugged — the substring/fuzzy fallbacks
-    can return a completely different endpoint.
-
-    Two defenses:
-      1. `include_loopback` is passed through as `expect_loopback`. The mic thread
-         passes False, so `all_microphones(include_loopback=False)` doesn't even
-         contain loopback (system-audio) endpoints — a loopback can never be a
-         fallback candidate for the mic channel. (This is the root-cause fix for
-         the duplicate-transcription bug: previously the mic thread hardcoded
-         include_loopback=True, so a disconnected mic fuzzy-fell-back onto a
-         loopback endpoint and captured the same system audio as the loop thread.)
-      2. We assert the resolved device is the exact endpoint requested (id equal)
-         AND that its `.isloopback` flag matches expectation. If either fails we
-         FAIL FAST with a clear Russian message rather than silently capturing the
-         wrong device. This turns the previously-silent wrong-device capture into a
-         surfaced capture error. Session applies a partial-vs-total policy to it
-         (see `Session._handle_capture_errors`): a single failed channel is
-         non-terminal (the other channel still records), all channels failing is
-         terminal.
+    The table is built from the `pyaudiowpatch` constants (imported lazily so
+    this module stays importable on non-Windows; after the first import this
+    is a `sys.modules` hit). This runs only on the error path.
     """
-    kind = "системного звука" if expect_loopback else "микрофона"
     try:
-        device = sc.get_microphone(device_id, include_loopback=expect_loopback)
-    except Exception as exc:  # IndexError('no device with id ...') and friends
-        raise RuntimeError(
-            f"Устройство {kind} не найдено (id={device_id!r}). "
-            "Возможно, оно отключено или недоступно."
-        ) from exc
-    # Reject soundcard's substring/fuzzy fallback: only the exact endpoint is OK.
-    if device.id != device_id:
-        raise RuntimeError(
-            f"Устройство {kind} не удалось однозначно определить: "
-            f"запрошен id={device_id!r}, а выбрано {device.name!r} "
-            f"(id={device.id!r}). Захват прекращён, чтобы не записать не то "
-            "устройство."
-        )
-    # The decisive guard against capturing system audio on the mic channel.
-    if bool(device.isloopback) != expect_loopback:
-        if expect_loopback:
-            raise RuntimeError(
-                f"Ожидалось устройство системного звука (loopback), но {device.name!r} "
-                "им не является."
-            )
-        raise RuntimeError(
-            f"Устройство микрофона {device.name!r} оказалось устройством "
-            "системного звука (loopback). Захват прекращён, чтобы не дублировать "
-            "системный звук на канале «Я»."
-        )
-    return device
+        import pyaudiowpatch as pyaudio
+    except ImportError:
+        return None
+    phrases = {
+        pyaudio.paDeviceUnavailable: "устройство отключено",
+        pyaudio.paInputOverflowed: "переполнение буфера ввода",
+        pyaudio.paOutputUnderflowed: "недополнение буфера вывода",
+        pyaudio.paInvalidDevice: "устройство недоступно",
+        pyaudio.paInvalidSampleRate: "устройство не поддерживает "
+        "запрошенную частоту дискретизации",
+        pyaudio.paInvalidChannelCount: "устройство не поддерживает "
+        "запрошенное число каналов",
+        pyaudio.paSampleFormatNotSupported: "формат сэмплов не поддерживается",
+        pyaudio.paUnanticipatedHostError: "непредвиденная ошибка "
+        "аудио-подсистемы",
+        pyaudio.paInternalError: "внутренняя ошибка аудио-подсистемы",
+        pyaudio.paNotInitialized: "аудио-подсистема не инициализирована",
+        pyaudio.paTimedOut: "таймаут аудио-операции",
+        pyaudio.paBadStreamPtr: "аудиопоток захвата закрыт",
+        pyaudio.paStreamIsStopped: "аудиопоток захвата остановлен",
+        pyaudio.paStreamIsNotStopped: "аудиопоток захвата не остановлен",
+        pyaudio.paInsufficientMemory: "недостаточно памяти",
+    }
+    return phrases.get(code)
+
+
+def _translate_backend_error(exc: Exception) -> Exception:
+    """Map a PyAudioWPatch/PortAudio failure to a compact Russian error.
+
+    PortAudio raises OSError with the numeric error CODE in `errno`
+    (== args[0]) and the English PortAudio text in `strerror` (see
+    _portaudiomodule.c: PyErr_SetObject(PyExc_IOError,
+    Py_BuildValue("(i,s)", err, Pa_GetErrorText(err)))). Mapped codes become
+    short Russian phrases (the code is appended for field diagnostics);
+    unmapped codes and non-OSError exceptions keep their original message so
+    nothing is lost.
+    """
+    if isinstance(exc, OSError) and isinstance(exc.errno, int):
+        phrase = _pa_phrase(exc.errno)
+        if phrase is not None:
+            err = RuntimeError(f"{phrase} (PortAudio {exc.errno})")
+            err.__cause__ = exc
+            return err
+    return exc
 
 
 class CaptureThread(threading.Thread):
@@ -110,7 +115,6 @@ class CaptureThread(threading.Thread):
         frame_size: int,
         target_sample_rate: int,
         expect_loopback: bool,
-        native_sample_rate: int = DEFAULT_NATIVE_RATE,
         chunk_frames: int = 1024,
         name: str = "capture",
     ) -> None:
@@ -120,11 +124,12 @@ class CaptureThread(threading.Thread):
         self.expect_loopback = expect_loopback
         self.frame_size = frame_size
         self.target_sample_rate = target_sample_rate
-        self.native_sample_rate = native_sample_rate
         self.chunk_frames = chunk_frames
 
         self._stop_event = threading.Event()
-        self._resampler = StreamingResampler(native_sample_rate, target_sample_rate)
+        # Created in run() AFTER the device is resolved, because the native
+        # rate is only known then (per-device defaultSampleRate).
+        self._resampler: StreamingResampler | None = None
         self._pending = np.empty(0, dtype=np.float32)
         self.error: Exception | None = None
         # Set once the device has been resolved+validated (the first thing run()
@@ -147,22 +152,60 @@ class CaptureThread(threading.Thread):
             self.out_queue.put(frame)
 
     def run(self) -> None:
+        stream = None
         try:
-            mic = _resolve_device(self.device_id, self.expect_loopback)
+            p = backend.get_backend()
+            # Exact name + isLoopbackDevice resolution, fail-fast (no fuzzy
+            # fallbacks): a mic channel can never open a loopback endpoint.
+            device = get_device(self.device_id, expect_loopback=self.expect_loopback)
+            # Per-device native rate: capture at the device's mix-format rate
+            # so WASAPI does no extra SRC; soxr takes it to the target rate.
+            native = int(device.get("defaultSampleRate") or 0)
+            if native <= 0:
+                native = DEFAULT_NATIVE_RATE
+            channels = int(device.get("maxInputChannels") or 0)
+            self._resampler = StreamingResampler(native, self.target_sample_rate)
             self.resolved.set()
             logger.debug(
-                "Capture start: %s (native=%d -> target=%d)",
+                "Capture start: %s (device=%r, native=%d -> target=%d)",
                 self.name,
-                self.native_sample_rate,
+                device.get("name"),
+                native,
                 self.target_sample_rate,
             )
-            with mic.recorder(
-                samplerate=self.native_sample_rate,
-                channels=None,
-                blocksize=self.chunk_frames,
-            ) as rec:
-                while not self._stop_event.is_set():
-                    block = rec.record(numframes=self.chunk_frames)
+            # Local import: after the first one this is a sys.modules hit.
+            # The constant is only needed here, never at module scope.
+            import pyaudiowpatch as pyaudio
+
+            stream = p.open(
+                format=pyaudio.paFloat32,
+                channels=channels,
+                rate=native,
+                input=True,
+                input_device_index=device["index"],
+                frames_per_buffer=self.chunk_frames,
+            )
+            while not self._stop_event.is_set():
+                # PyAudioWPatch's stream.read() returns bytes (the C layer
+                # builds a PyBytes of frames*channels*4); tolerate a
+                # (bytes, n) tuple in case a future fork changes the type.
+                data = stream.read(self.chunk_frames)
+                if isinstance(data, tuple):
+                    # Validate the payload so an unexpected shape (e.g.
+                    # (n, bytes) or an empty tuple) fails here with a clear
+                    # error instead of a cryptic frombuffer crash.
+                    if not data or not isinstance(
+                        data[0], (bytes, bytearray, memoryview)
+                    ):
+                        shape = ", ".join(type(x).__name__ for x in data)
+                        raise TypeError(
+                            "Unexpected stream.read() result: expected bytes "
+                            f"or (bytes, n); got tuple({shape or 'empty'})"
+                        )
+                    data = data[0]
+                block = np.frombuffer(data, dtype=np.float32)
+                if block.size:
+                    block = block.reshape(-1, channels)
                     mono = _downmix_mono(block)
                     resampled = self._resampler.resample_chunk(mono)
                     self._emit_frames(resampled)
@@ -177,9 +220,16 @@ class CaptureThread(threading.Thread):
                 self.out_queue.put(last)
                 self._pending = np.empty(0, dtype=np.float32)
         except Exception as exc:  # surfaced to Session via .error
-            self.error = exc
+            self.error = _translate_backend_error(exc)
             logger.exception("Capture thread %s failed", self.name)
         finally:
+            if stream is not None:
+                try:
+                    stream.close()
+                except Exception:  # noqa: BLE001 - may already be closed
+                    logger.debug(
+                        "Error closing capture stream %s", self.name, exc_info=True
+                    )
             # Sentinel so consumers can drain and stop.
             self.out_queue.put(None)
             logger.debug("Capture stop: %s", self.name)

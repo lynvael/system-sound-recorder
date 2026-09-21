@@ -14,7 +14,10 @@ dependencies = [
     # silero-vad 6.x imports onnxruntime at package import time but does not
     # declare it as a dependency; required for `import silero_vad` to succeed.
     "onnxruntime",
-    "soundcard",
+    # WASAPI loopback capture backend (PyAudio/PortAudio fork). PyPI ships
+    # Windows wheels only (win32/win_amd64), so the marker keeps `uv sync`
+    # working on the Linux dev box; on Windows it installs as usual.
+    "PyAudioWPatch>=0.2.12.8; sys_platform == 'win32'",
     "soundfile",
     "soxr",
     "pydantic-settings",

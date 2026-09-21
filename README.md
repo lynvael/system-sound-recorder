@@ -13,8 +13,9 @@ PySide6 и headless CLI для сценариев без интерфейса.
 
 ## Требования
 
-- Windows 10/11 (WASAPI loopback — Windows-специфичная возможность, `soundcard`
-  на других ОС системный звук так не отдаёт)
+- Windows 10/11 (WASAPI loopback — Windows-специфичная возможность; аудио-бэкенд
+  `PyAudioWPatch` — форк PyAudio/PortAudio с loopback — дистрибутируется только
+  Windows-wheels, поэтому на других ОС системный звук так не отдаётся)
 - Python >= 3.12
 - [uv](https://docs.astral.sh/uv/) для управления окружением и зависимостями
 
@@ -24,9 +25,15 @@ PySide6 и headless CLI для сценариев без интерфейса.
 uv sync
 ```
 
-Это ставит базовый набор (GUI, VAD, захват аудио, CPU-сборка torch). Чтобы
-добавить STT-движок GigaAM-v3 (единственный движок распознавания, только
-русский язык):
+Это ставит базовый набор (GUI, VAD, захват аудио, CPU-сборка torch).
+
+Примечание для dev-окружений вне Windows: `PyAudioWPatch` ставится только на
+Windows (платформенный маркер в `pyproject.toml`), поэтому на Linux `uv sync`
+проходит, а захват/перечисление устройств недоступны — file-режим
+(`transcribe`) при этом работает.
+
+Чтобы добавить STT-движок GigaAM-v3 (единственный движок распознавания,
+только русский язык):
 
 ```powershell
 uv sync --extra gigaam
@@ -71,7 +78,10 @@ CLI дублирует тот же пайплайн, что и GUI, но без 
 python -m app.cli list-devices
 ```
 
-Печатает микрофоны и loopback-устройства с их id — эти id нужны для `record`.
+Печатает микрофоны и loopback-устройства. «id» устройства — это его **имя**
+(PortAudio не отдаёт стабильный id устройства), это имя и передаётся в
+`record`. Loopback-устройства — это input-устройства с суффиксом
+` [Loopback]` (флаг `isLoopbackDevice=True` в PortAudio).
 
 ### Расшифровка готового файла
 
@@ -97,7 +107,8 @@ uv run python -m app.cli transcribe recording.wav
 python -m app.cli record --mic-id ID --loopback-id ID [--mode {live,batch}] [--output-dir DIR]
 ```
 
-- `--mic-id` / `--loopback-id` — обязательны, берутся из `list-devices`.
+- `--mic-id` / `--loopback-id` — обязательны; это **имя** устройства из
+  `list-devices` («id» = имя).
 - `--mode` — `live` (расшифровка по ходу записи) или `batch` (расшифровка
   запускается по остановке); по умолчанию `batch`.
 - `--output-dir` — как у `transcribe`.
@@ -105,7 +116,7 @@ python -m app.cli record --mic-id ID --loopback-id ID [--mode {live,batch}] [--o
 Пример:
 
 ```powershell
-uv run python -m app.cli record --mic-id "<id микрофона>" --loopback-id "<id loopback>" --mode batch
+uv run python -m app.cli record --mic-id "<имя микрофона>" --loopback-id "<имя loopback>" --mode batch
 ```
 
 Команда работает до нажатия **Ctrl-C** (или EOF на stdin — удобно в

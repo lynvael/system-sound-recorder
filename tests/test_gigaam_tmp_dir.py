@@ -191,7 +191,7 @@ def test_factory_passes_work_dir_through(monkeypatch):
 def test_session_stt_tmp_dir_is_outside_session_dir(tmp_path):
     try:
         from app.pipeline.session import Session
-    except Exception as exc:  # soundcard/PulseAudio may be unavailable headless
+    except Exception as exc:  # the audio backend may be unavailable headless
         pytest.skip(f"app.pipeline.session not importable here: {exc}")
 
     config = Config()

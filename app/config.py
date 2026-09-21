@@ -32,7 +32,7 @@ class CaptureSettings(_Base):
     frame_size: int = 512
     # Single source of truth for the pipeline sample rate (VAD + resampler).
     target_sample_rate: int = 16000
-    # How many native-rate frames to pull per soundcard.record() call.
+    # How many native-rate frames to pull per stream.read() call.
     chunk_frames: int = 1024
 
     # Speaker labels. mic -> left channel ("Я"), loopback -> right ("Собеседники").

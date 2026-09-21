@@ -233,7 +233,7 @@ class SessionWorker(QObject):
         def _run() -> None:
             try:
                 # Local import: keeps app.summarize off this module's
-                # import-time surface (symmetry with the lazy soundcard
+                # import-time surface (symmetry with the lazy audio-backend
                 # imports elsewhere in the GUI layer; also avoids paying
                 # for the LLM client import until it's actually used).
                 from app.summarize import run_summarization

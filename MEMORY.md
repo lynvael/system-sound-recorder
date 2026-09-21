@@ -1,3 +1,4 @@
+- (2026-09-21) PortAudio v19 (в составе PyAudioWPatch) имеет ДРУГУЮ нумерацию констант, чем старый PyAudio/v18: форматы — битовые флаги (paFloat32=1, не 3), коды ошибок сдвинуты (paNotInitialized=-10000, paDeviceUnavailable=-9985, paInputOverflowed=-9981), paBufferOverflow/paDevicesNotAvailable/paInvalidSampleFormat в v19 не существуют. Ссылаться только на именованные константы модуля pyaudiowpatch, никогда на литералы; stub в tests/conftest.py содержит реальные v19-значения.
 # Project Memory — Live Recorder
 
 Facts that help future work and are NOT obvious from the code alone.
@@ -74,19 +75,21 @@ segmenter, `app/common/{config,log}.py`).
   zero-speech recording (VAD found nothing) never false-positives.
 
 ## Gotchas / traps
-- **Don't import `soundcard` (directly or transitively) at module scope in GUI code
-  that loads before `QApplication` exists** — it breaks launch with
-  `QWindowsContext: OleInitialize() failed: COM error 0x80010106 (RPC_E_CHANGED_MODE)`.
-  `soundcard`'s import runs `CoInitializeEx(MTA)` on the main thread; if that happens
-  before Qt creates `QApplication` (which does `OleInitialize` → STA), Qt loses the
-  apartment race. Only `app/audio/devices.py` and `app/audio/capture.py` import
-  soundcard, but BOTH are reachable from `app/gui/main_window.py` at import time:
-  directly (`devices`) and transitively via `app.gui.worker → app.pipeline.session →
-  app.audio.capture`. Fix: those imports in main_window are LAZY (inside
-  `_populate_devices` / `__init__` / `_on_start_clicked`), so they run only after
-  `main()` has constructed `QApplication`. soundcard itself tolerates STA (it catches
-  `RPC_E_CHANGED_MODE` and falls back), so no backend/threading change is needed — just
-  keep those imports off module scope. See the NOTE block near the top of main_window.py.
+- **The audio backend (PyAudioWPatch, ADR-001) must not be initialized before
+  `QApplication` exists.** The old `soundcard` backend ran `CoInitializeEx(MTA)` at
+  import time and lost the COM apartment race against Qt's STA (`OleInitialize()
+  failed: RPC_E_CHANGED_MODE`). The replacement: importing `pyaudiowpatch` is
+  harmless, but CREATING the `PyAudio()` instance runs PortAudio's `CoInitialize`
+  (STA, Qt-compatible) — so the instance is a LAZY module singleton in
+  `app.audio.backend` (`get_backend()`, double-checked locking, `shutdown()` via
+  atexit), created on first real use (device enumeration / capture start), and
+  `app.audio.devices` / `app.audio.capture` are imported lazily in the GUI
+  (main_window's `_populate_devices` / `__init__` / `_on_start_clicked`) so no audio
+  code runs before `main()` constructs `QApplication`. `pyaudiowpatch` ships
+  Windows-only wheels → `sys_platform == 'win32'` dep marker in pyproject.toml: on
+  the Linux dev box the audio modules still import (lazy import), capture /
+  list-devices raise a Russian RuntimeError, and tests use the conftest stub.
+  See the NOTE block near the top of main_window.py and docs/adr/0001.
 - **Native Windows `QFileDialog` freezes the GUI on file-open.** `getOpenFileName`'s
   native Win32 dialog synchronously enumerates shell namespace extensions
   (OneDrive/cloud overlays, network/mapped drives in Quick access/Recent) on the UI
@@ -102,20 +105,21 @@ segmenter, `app/common/{config,log}.py`).
   `_is_stopped`. (AlignedRecorder's `self._stop` Event is fine — it is NOT a Thread
   subclass, it runs a separate `threading.Thread(target=self._run)`.) This class of bug
   is invisible to compile/import checks — only shows at runtime when join() is called.
-- **`soundcard.get_microphone(id, include_loopback=True)` does FUZZY id matching** and
-  will silently fall back to a LOOPBACK endpoint when a mic id no longer resolves exactly
-  (e.g. mic physically unplugged). `_match_device` tries exact-id → name-substring → regex
-  fuzzy; `all_microphones(include_loopback=True)` lists loopbacks first, so a disconnected
-  mic resolved to a system-audio endpoint. Result: the mic ("Я") channel captured the SAME
-  system audio as the loopback ("Собеседники") channel → EVERY utterance transcribed twice
-  (duplicated live replicas). Fix (in `app/audio/capture.py`): `CaptureThread` takes a
-  required `expect_loopback` bool; `_resolve_device` passes it as `include_loopback` (mic=
-  False so a loopback can't even be a candidate) AND validates the resolved device — exact
-  `device.id == requested id` (rejects any fuzzy fallback) and `device.isloopback ==
-  expect_loopback` — raising a Russian error. `_start_captures` passes
-  `expect_loopback=[False, True]` for `[mic, loopback]`. Do NOT "solve" this class of
-  duplication with content/correlation dedup (deliberately removed — see file-mode note
-  above); fix device resolution at the source.
+- **The mic channel must NEVER resolve to a loopback endpoint** (invariant #1).
+  Root cause of the original duplicated-transcription bug: the old `soundcard`
+  backend's FUZZY id matching (`_match_device`: exact-id → name-substring → regex
+  fuzzy) silently fell back to a LOOPBACK endpoint when a mic id stopped resolving
+  (e.g. mic unplugged) — the mic ("Я") channel then captured the SAME system audio
+  as the loopback ("Собеседники") channel and EVERY utterance was transcribed
+  twice. Current protection (ADR-001, PyAudioWPatch): device identity is the NAME
+  (PortAudio keeps the WASAPI endpoint id in its C struct but does not export it to
+  Python); `app/audio/devices.get_device` matches on EXACT name +
+  `isLoopbackDevice == expect_loopback` with NO fuzzy/substring fallbacks —
+  0 matches → Russian «не найдено», >1 → «неоднозначно» (fail-fast). `CaptureThread`
+  takes a required `expect_loopback` bool; `_start_captures` passes
+  `expect_loopback=[False, True]` for `[mic, loopback]`. Do NOT "solve" this class
+  of duplication with content/correlation dedup (deliberately removed — see
+  file-mode note above); fix device resolution at the source.
 - **Capture-device failure is PARTIAL-tolerant** (see `Session._handle_capture_errors`,
   `_abort_if_all_captures_failed_at_start`). A capture thread that can't resolve its device
   sets `.error` and exits WITHOUT setting `.resolved`, but still emits
@@ -178,9 +182,12 @@ segmenter, `app/common/{config,log}.py`).
   scaled loopback copy) to detect the user's own voice.
 - **`silero-vad==6.2.2` imports `onnxruntime` at package import but doesn't declare it** —
   `onnxruntime` is in base deps for this reason. Don't remove it.
-- **Native capture rate is assumed 48000 Hz** (`soundcard` needs an explicit samplerate
-  and has no reliable native-rate API); soxr resamples to 16 kHz. Revisit if a device's
-  native rate differs — would need plumbing through config.
+- **Native capture rate is per-device** (ADR-001): `CaptureThread.run()` reads the
+  resolved device's `defaultSampleRate` (WASAPI mix-format rate) and opens the stream
+  at that rate in `paFloat32`; `DEFAULT_NATIVE_RATE = 48000` (app/audio/capture.py)
+  is only a fallback when the value is missing/<= 0. soxr then resamples to the
+  target rate. (The old backend had no native-rate API, hence the old hardcoded
+  48000 passed from session.py.)
 - **Dep pins are chosen for GigaAM-v3 compat:** `torch==2.8.0`, `torchaudio==2.8.0`,
   `transformers==4.57.1`. GigaAM extras (`[gigaam]`): pyannote-audio, hydra-core,
   omegaconf, sentencepiece, torchcodec. GigaAM is Russian-only and transcribes via a
@@ -309,3 +316,9 @@ Windows, Python >=3.12, package manager **uv**. `uv sync` (base) / `uv sync --ex
 CPU torch via default PyPI index; commented `pytorch-cu128` index in pyproject.toml is the
 GPU opt-in. Run: `python -m app` (GUI), `python -m app.cli {list-devices,transcribe,record}`
 (CLI), or `scripts/run-{gui,cli}.{ps1,bat}`.
+
+## Decisions
+- (2026-09-21) ADR-001 (soundcard → PyAudioWPatch) реализован 2026-09-21: новый app/audio/backend.py (ленивый синглтон PyAudio, единственная точка создания инстанса), identity устройства = ИМЯ (GUI combo data и CLI --mic-id/--loopback-id теперь = имя из list-devices, не endpoint id), native rate per-device из defaultSampleRate. Ждёт ручного чек-листа ADR на Windows с Jabra (п.1 — критичный риск R1).
+
+## Goals
+- (2026-09-21) После миграции ADR-001 (2026-09-21) аудио-захват снова не верифицирован на железе: выполнить чек-лист ADR п.1–11 на Windows с Jabra Evolve2 30 SE; п.1 (Jabra открывается без AssertionError в paFloat32 на defaultSampleRate) — первый и главный шаг, митигция R1 — is_format_supported() перед open().
