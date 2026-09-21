@@ -508,7 +508,13 @@ class MainWindow(QMainWindow):
         dirs: list[Path] = []
         if self._recordings_root.exists():
             try:
-                dirs = [d for d in self._recordings_root.iterdir() if d.is_dir()]
+                # Dot-prefixed dirs are app-internal helpers (e.g. the STT
+                # engine's .stt_tmp temp-WAV dir) — never sessions.
+                dirs = [
+                    d
+                    for d in self._recordings_root.iterdir()
+                    if d.is_dir() and not d.name.startswith(".")
+                ]
             except OSError:
                 dirs = []
         dirs.sort(key=lambda d: d.name, reverse=True)

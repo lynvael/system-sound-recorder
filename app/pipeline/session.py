@@ -228,6 +228,15 @@ class Session:
         safe_name = _sanitize_session_name(name)
         dir_name = f"{timestamp}_{safe_name}" if safe_name else timestamp
         self.session_dir = Path(config.session.output_dir) / dir_name
+        # Dedicated directory for the STT engine's temp WAVs (GigaAM writes one
+        # per segment). It must stay OUTSIDE session_dir: session names may be
+        # Cyrillic (sanitization deliberately preserves them), and GigaAM's
+        # remote code cannot open non-ASCII paths on Windows ([WinError 2]).
+        # The name is ASCII-only; the engine re-validates the resolved path
+        # (absolute, ASCII) and falls back to the system tempdir when it is
+        # unusable. The GUI session picker skips dot-prefixed dirs, so this
+        # helper dir never shows up as a session.
+        self._stt_tmp_dir = Path(config.session.output_dir) / ".stt_tmp"
         self.wav_path = self.session_dir / "session.wav"
         # Per-channel mono outputs (live/batch). Derived in lockstep from the
         # same aligned blocks as session.wav, so they stay sample-for-sample
@@ -656,7 +665,7 @@ class Session:
         self._validate_capture_devices()
         self._set_status("Загрузка модели…")
         try:
-            self._engine = build_engine(self.config)
+            self._engine = build_engine(self.config, work_dir=self._stt_tmp_dir)
         except Exception as exc:
             # Surface, then propagate so start() raises and the GUI worker resets
             # instead of being left with a half-initialized session.
@@ -796,7 +805,7 @@ class Session:
         if self._engine is None:
             self._set_status("Загрузка модели…")
             try:
-                self._engine = build_engine(self.config)
+                self._engine = build_engine(self.config, work_dir=self._stt_tmp_dir)
             except Exception as exc:
                 self._emit_error(f"Не удалось загрузить модель STT: {exc}")
                 self._finish()

@@ -37,6 +37,11 @@ gigaam = [
     "torchcodec==0.7.0",
 ]
 
+[dependency-groups]
+dev = [
+    "pytest",
+]
+
 [project.scripts]
 live-recorder = "app.__main__:_run"
 

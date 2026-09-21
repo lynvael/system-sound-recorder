@@ -4,6 +4,13 @@ Loaded via `AutoModel.from_pretrained("ai-sage/GigaAM-v3", revision=...,
 trust_remote_code=True)`. `model.transcribe(path)` takes a FILE PATH, so each
 numpy segment is written to a temporary 16 kHz WAV, transcribed, then deleted.
 
+The temp WAV lives in a dedicated directory (`work_dir`, threaded in by the
+factory) rather than the system tempdir: GigaAM's remote code opens the path
+through non-Unicode-safe Win32 APIs, so a non-ASCII path (a Cyrillic Windows
+username in %TEMP%) makes the model fail to open a file we just wrote
+([WinError 2]). The engine validates the resolved path is ASCII-only and
+degrades to the system tempdir when no usable dir is given.
+
 GigaAM-v3's short-form `model.transcribe()` rejects clips over ~30 s ("Too long
 wav file, use 'transcribe_longform' method."). `transcribe_longform` is NOT used
 here (product decision). Instead, over-length segments are sliced by us with the
@@ -19,6 +26,7 @@ from __future__ import annotations
 import os
 import tempfile
 import time
+from pathlib import Path
 
 import numpy as np
 import soundfile as sf
@@ -46,6 +54,70 @@ _MAX_TRANSCRIBE_SECONDS = 24.0
 _SPLIT_MAX_DURATION = 20.0
 
 
+def _warn_if_system_tempdir_non_ascii() -> None:
+    """Log an ERROR when the system-tempdir fallback is itself non-ASCII.
+
+    A non-ASCII system tempdir (a Cyrillic Windows username in %TEMP%) is
+    the original field failure mode: GigaAM's remote code likely cannot open
+    the temp WAV there either, so transcription will keep failing with
+    [WinError 2] until the dir is fixed.
+    """
+    system_tempdir = Path(tempfile.gettempdir()).resolve()
+    if not str(system_tempdir).isascii():
+        logger.error(
+            "System tempdir %s is also non-ASCII; GigaAM on Windows likely "
+            "cannot open the temp WAV there either ([WinError 2])",
+            system_tempdir,
+        )
+
+
+def _resolve_tmp_dir(work_dir: str | Path | None) -> str | None:
+    """Resolve the directory for per-segment temp WAVs.
+
+    Returns an absolute, ASCII-only directory path, or None to fall back to
+    the system tempdir (the `tempfile.mkstemp` default). The path MUST be
+    ASCII-only: GigaAM's remote code opens the WAV through non-Unicode-safe
+    Win32 APIs, so a non-ASCII path (a Cyrillic Windows username in %TEMP%,
+    a Cyrillic session name, ...) makes the model fail to open the file we
+    just wrote ([WinError 2] "file not found"). Any disqualification (no/
+    empty dir given, non-ASCII, uncreatable) degrades to the system tempdir
+    instead of failing the engine — a missing dir is a performance/
+    robustness concern, not a fatal one.
+    """
+    if not work_dir:  # None or empty string -> system tempdir
+        _warn_if_system_tempdir_non_ascii()
+        return None
+    try:
+        path = Path(work_dir).expanduser().resolve()
+    except (OSError, RuntimeError) as exc:
+        logger.warning(
+            "Cannot resolve STT temp dir %r: %s; using system tempdir",
+            work_dir,
+            exc,
+        )
+        _warn_if_system_tempdir_non_ascii()
+        return None
+    if not str(path).isascii():
+        logger.warning(
+            "STT temp dir %s is not ASCII-only; using system tempdir "
+            "(GigaAM cannot open non-ASCII paths on Windows)",
+            path,
+        )
+        _warn_if_system_tempdir_non_ascii()
+        return None
+    try:
+        path.mkdir(parents=True, exist_ok=True)
+    except OSError as exc:
+        logger.warning(
+            "Cannot create STT temp dir %s: %s; using system tempdir",
+            path,
+            exc,
+        )
+        _warn_if_system_tempdir_non_ascii()
+        return None
+    return str(path)
+
+
 class GigaAMDependencyError(RuntimeError):
     """Raised when GigaAM extra dependencies are not installed."""
 
@@ -56,6 +128,7 @@ class GigaAMEngine:
         settings: STTSettings,
         sample_rate: int,
         vad: VADSettings,
+        work_dir: str | Path | None = None,
     ) -> None:
         self.s = settings
         self.sample_rate = sample_rate
@@ -67,6 +140,10 @@ class GigaAMEngine:
         # Silero model is built lazily on the first over-length segment, so
         # short-only sessions never pay the VAD load cost.
         self._vad_model = None
+        # Directory for per-segment temp WAVs (absolute, ASCII-only) or None
+        # for the system tempdir. Resolved eagerly so a bad work_dir degrades
+        # to the fallback at engine construction, not mid-session.
+        self._tmp_dir = _resolve_tmp_dir(work_dir)
 
         try:
             from transformers import AutoModel
@@ -117,16 +194,27 @@ class GigaAMEngine:
     def _transcribe_short(self, audio: np.ndarray) -> str:
         """Short-form transcribe of a <= limit clip via a temp WAV.
 
-        A genuine `model.transcribe()` error is allowed to propagate: the session
-        worker's per-segment except handles it as NON-terminal (see MEMORY). We
-        never swallow it into empty text.
+        The temp WAV is written to the engine's dedicated temp dir when one is
+        configured (`self._tmp_dir`), else to the system tempdir.
+
+        A genuine `sf.write()` / `model.transcribe()` error is allowed to
+        propagate: the session worker's per-segment except handles it as
+        NON-terminal (see MEMORY). We never swallow it into empty text. The
+        error is re-raised with the temp file's FULL PATH embedded, because the
+        session worker logs only the exception's str — a field failure (AV
+        interference in %TEMP%, a broken path, ...) must be diagnosable from
+        that single log line.
         """
-        fd, tmp_path = tempfile.mkstemp(suffix=".wav", prefix="gigaam_")
+        fd, tmp_path = tempfile.mkstemp(
+            suffix=".wav", prefix="gigaam_", dir=self._tmp_dir
+        )
         os.close(fd)
         try:
             sf.write(tmp_path, audio, self.sample_rate, subtype="PCM_16")
             result = self.model.transcribe(tmp_path)
             return self._extract_text(result).strip()
+        except Exception as exc:
+            raise RuntimeError(f"{exc} (temp WAV: {tmp_path})") from exc
         finally:
             try:
                 os.remove(tmp_path)

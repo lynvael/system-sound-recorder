@@ -198,6 +198,27 @@ segmenter, `app/common/{config,log}.py`).
   Silero loads LAZILY on first long segment. If sub-VAD yields ZERO chunks for known-speech
   audio, `_fixed_windows` hard-splits into ≤20s windows so a long segment is never dropped.
   Sub-chunk transcribe errors propagate (non-terminal).
+- **GigaAM temp WAVs live in `<output_dir>/.stt_tmp/`, NOT in %TEMP% or session_dir
+  (field fix, 2026-09-21: every segment failed `[WinError 2] Не удается найти
+  указанный файл`).** GigaAM's remote code opens the temp WAV through non-Unicode-safe
+  Win32 APIs: on the client (Cyrillic Windows username) %TEMP% =
+  `C:\Users\<кириллица>\AppData\Local\Temp` and the model could not open the file we
+  had JUST written (recording itself was fine). The temp path must be ASCII-only, and
+  session_dir is NOT a candidate either (session names deliberately keep Cyrillic —
+  `_sanitize_session_name`). Plumbing: `Session._stt_tmp_dir = <output_dir>/.stt_tmp`
+  → `build_engine(config, work_dir=...)` → `GigaAMEngine(work_dir=...)`;
+  the module-level `_resolve_tmp_dir()` in `app/stt/gigaam_engine.py` (NOT a
+  method) resolves the path to ABSOLUTE, checks `.isascii()`,
+  `mkdir(parents=True, exist_ok=True)`; any disqualification (None / empty /
+  non-ASCII / uncreatable) degrades to the system tempdir with a WARNING
+  (plus an ERROR if the system tempdir itself is non-ASCII) — never raises.
+  Transcribe
+  errors (`sf.write` or `model.transcribe`) are re-raised as
+  `RuntimeError(f"{exc} (temp WAV: {tmp_path})")` because the session worker logs only
+  the exception's str — the single "Пропущен сегмент (ошибка транскрипции): ..." line
+  must carry the full temp path for field diagnosis. The GUI session picker skips
+  dot-prefixed dirs so `.stt_tmp` never shows up as a session. Unit-tested without the
+  model (fake `AutoModel.from_pretrained`) in `tests/test_gigaam_tmp_dir.py`.
 - `transformers==4.57.1` pipeline uses the kwarg `dtype` (NOT `torch_dtype`).
 - Drift-trim bound in recorder is `_DRIFT_TRIM_SECONDS = 1.0` — tune after a 30–60 min
   sync test if drift becomes audible.
