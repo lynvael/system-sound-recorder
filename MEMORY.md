@@ -305,6 +305,18 @@ tests. See "Верификация" in `kind-hatching-allen.md`.
   summarization never touches or deletes the existing `transcript.*` files, so
   retrying is always safe.
 
+- **QSettings quirks (GUI device prefs, `app/gui/prefs.py`, 2026-09-21).**
+  (1) On Linux `QSettings(IniFormat, UserScope)` resolves to
+  `$XDG_CONFIG_HOME/<org>/<app>.ini` (NOT the CWD), and Qt CACHES that
+  location after the first QSettings construction in the process — changing
+  `XDG_CONFIG_HOME` between tests is ignored (per-test tmp dirs leak across
+  tests). Tests therefore monkeypatch `prefs.QSettings` to the FILE-NAME
+  constructor `QSettings(path, IniFormat)` — per-instance, deterministic on
+  every platform. (2) PySide6's `QSettings.sync()` returns `None` (not a
+  bool) on success — check `is False`, never `not sync()`. (3) The INI
+  writer renders key `devices/mic` as section `[devices]` + key `mic`
+  (assert on that when checking file contents).
+
 ## Fixed footguns
 - **`pyproject.toml`'s `readme =` pointed at a nonexistent `kind-hatching-allen.md`**,
   which broke `uv sync` (hatchling build fails without a valid readme file). Fixed
@@ -318,7 +330,9 @@ GPU opt-in. Run: `python -m app` (GUI), `python -m app.cli {list-devices,transcr
 (CLI), or `scripts/run-{gui,cli}.{ps1,bat}`.
 
 ## Decisions
+- (2026-09-21) (2026-09-21) Предвыбор устройств в GUI: приоритет = сохранённый выбор (QSettings "LiveRecorder"/"LiveRecorder", ключи devices/mic, devices/loopback) → системный дефолт (devices.default_device_names()) → первый пункт; запись в prefs только при реальном изменении пользователем (blockSignals при программном предвыборе); hot-plug намеренно НЕ отслеживается (у PortAudio нет уведомлений о смене устройств); флаги CLI record --mic-id/--loopback-id намеренно остались обязательными (детерминированный скриптинг).
 - (2026-09-21) ADR-001 (soundcard → PyAudioWPatch) реализован 2026-09-21: новый app/audio/backend.py (ленивый синглтон PyAudio, единственная точка создания инстанса), identity устройства = ИМЯ (GUI combo data и CLI --mic-id/--loopback-id теперь = имя из list-devices, не endpoint id), native rate per-device из defaultSampleRate. Ждёт ручного чек-листа ADR на Windows с Jabra (п.1 — критичный риск R1).
 
 ## Goals
+- (2026-09-21) (2026-09-21) Верифицировать на Windows (нет в dev-окружении): (1) на старте GUI предвыбираются дефолтные устройства (микрофон + loopback вывода по умолчанию, маркеры в list-devices); (2) ручной выбор combo сохраняется между запусками (HKCU\Software\LiveRecorder\LiveRecorder) и бьёт авто-предвыбор; (3) get_default_*_device_info() PyAudioWPatch реально возвращают dict с isLoopbackDevice (допущение, покрыто только фейками).
 - (2026-09-21) После миграции ADR-001 (2026-09-21) аудио-захват снова не верифицирован на железе: выполнить чек-лист ADR п.1–11 на Windows с Jabra Evolve2 30 SE; п.1 (Jabra открывается без AssertionError в paFloat32 на defaultSampleRate) — первый и главный шаг, митигция R1 — is_format_supported() перед open().

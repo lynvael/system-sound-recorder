@@ -105,15 +105,23 @@ def _cmd_list_devices(args: argparse.Namespace) -> int:
     try:
         mics = devices.list_microphones()
         loopbacks = devices.list_loopbacks()
+        try:
+            default_mic, default_loopback = devices.default_device_names()
+        except Exception:  # noqa: BLE001 - default markers are best-effort:
+            # the lists above already succeeded, so a failure here just means
+            # "no markers", never an error.
+            default_mic = default_loopback = None
     except Exception as exc:  # noqa: BLE001 - e.g. non-Windows: no backend
         _eprint(f"[ошибка] Не удалось получить список устройств: {exc}")
         return 1
     print("=== Микрофоны ===")
     for name, dev_id in mics:
-        print(f"  {name}\n    id: {dev_id}")
+        marker = "  ← по умолчанию" if name == default_mic else ""
+        print(f"  {name}{marker}\n    id: {dev_id}")
     print("\n=== Системный звук (loopback) ===")
     for name, dev_id in loopbacks:
-        print(f"  {name}\n    id: {dev_id}")
+        marker = "  ← по умолчанию" if name == default_loopback else ""
+        print(f"  {name}{marker}\n    id: {dev_id}")
     return 0
 
 

@@ -41,6 +41,11 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
+from app.log import get_logger
+from app.gui.prefs import load_device_prefs, save_device_prefs
+
+logger = get_logger("gui.main_window")
+
 # --- shared contract with the backend --------------------------------------
 # TODO(reconcile-with-backend): device enumeration lives in app/audio/devices.py
 # and is expected to return List[Tuple[str, Any]] (name, id) pairs for both
@@ -265,6 +270,11 @@ class MainWindow(QMainWindow):
 
         self.mode_combo.currentIndexChanged.connect(self._update_mode_dependent_widgets)
         self.mic_check.toggled.connect(self._update_mode_dependent_widgets)
+        # Device-choice persistence: fires only on REAL user changes -- the
+        # initial populate/preselect in `_populate_devices` runs with
+        # signals blocked (see there).
+        self.mic_combo.currentIndexChanged.connect(self._on_device_changed)
+        self.loopback_combo.currentIndexChanged.connect(self._on_device_changed)
         self.open_file_button.clicked.connect(self._on_open_file_clicked)
         self.start_button.clicked.connect(self._on_start_clicked)
         self.stop_button.clicked.connect(self._on_stop_clicked)
@@ -380,31 +390,95 @@ class MainWindow(QMainWindow):
         # runs from `MainWindow.__init__`, which `main()` only calls after
         # constructing `QApplication` -- see the COM-apartment-ordering note
         # near the top of this module.
+        #
+        # Signals are blocked for the WHOLE populate+preselect block so the
+        # programmatic addItem/setCurrentIndex never fires the
+        # currentIndexChanged save slot (same pattern as
+        # `_refresh_session_list`).
+        self.mic_combo.blockSignals(True)
+        self.loopback_combo.blockSignals(True)
         try:
-            from app.audio.devices import list_loopbacks, list_microphones
-        except Exception:  # pragma: no cover - backend module not available yet
-            self.mic_combo.addItem("(модуль устройств недоступен)", None)
-            self.loopback_combo.addItem("(модуль устройств недоступен)", None)
-            return
+            try:
+                from app.audio.devices import list_loopbacks, list_microphones
+            except Exception:  # pragma: no cover - backend module not available yet
+                self.mic_combo.addItem("(модуль устройств недоступен)", None)
+                self.loopback_combo.addItem("(модуль устройств недоступен)", None)
+                return
+            try:
+                mics = list_microphones()
+                loopbacks = list_loopbacks()
+            except Exception as exc:  # noqa: BLE001
+                self._show_error(f"Не удалось получить список устройств: {exc}")
+                mics, loopbacks = [], []
+
+            if not mics:
+                self.mic_combo.addItem("(микрофоны не найдены)", None)
+            for name, _device_id in mics:
+                # Device identity IS the name (PortAudio exports no stable
+                # endpoint id): the combo data must be the exact name, so
+                # capture resolution matches what `list-devices` prints.
+                self.mic_combo.addItem(name, name)
+
+            if not loopbacks:
+                self.loopback_combo.addItem("(системный звук не найден)", None)
+            for name, _device_id in loopbacks:
+                self.loopback_combo.addItem(name, name)
+
+            self._preselect_devices()
+        finally:
+            self.mic_combo.blockSignals(False)
+            self.loopback_combo.blockSignals(False)
+
+    def _preselect_devices(self) -> None:
+        """Preselect each combo's initial device (called with signals
+        blocked, from `_populate_devices`).
+
+        Priority per combo, independently:
+          1. the name saved by the user (``load_device_prefs``), if it is
+             among the combo's ``itemData`` entries;
+          2. otherwise the system default (``devices.default_device_names``),
+             if it is among the entries;
+          3. otherwise keep the first item (the previous behaviour).
+
+        Each source degrades gracefully on its own: a prefs read failure or
+        a ``default_device_names()`` failure (e.g. the non-Windows
+        RuntimeError) just skips that source -- no error dialog, the device
+        list is already shown.
+        """
+        saved_mic = saved_loopback = None
         try:
-            mics = list_microphones()
-            loopbacks = list_loopbacks()
-        except Exception as exc:  # noqa: BLE001
-            self._show_error(f"Не удалось получить список устройств: {exc}")
-            mics, loopbacks = [], []
+            saved_mic, saved_loopback = load_device_prefs()
+        except Exception:  # noqa: BLE001 - prefs must never break startup
+            logger.warning("Не удалось прочитать сохранённые устройства", exc_info=True)
 
-        if not mics:
-            self.mic_combo.addItem("(микрофоны не найдены)", None)
-        for name, _device_id in mics:
-            # Device identity IS the name (PortAudio exports no stable
-            # endpoint id): the combo data must be the exact name, so
-            # capture resolution matches what `list-devices` prints.
-            self.mic_combo.addItem(name, name)
+        default_mic = default_loopback = None
+        try:
+            # Lazy import: app.audio.devices reaches the audio backend (COM
+            # apartment ordering -- see the note at the top of this module).
+            from app.audio.devices import default_device_names
 
-        if not loopbacks:
-            self.loopback_combo.addItem("(системный звук не найден)", None)
-        for name, _device_id in loopbacks:
-            self.loopback_combo.addItem(name, name)
+            default_mic, default_loopback = default_device_names()
+        except Exception:  # noqa: BLE001 - e.g. non-Windows: no backend
+            logger.debug(
+                "default_device_names() недоступен — предвыбор по системным "
+                "устройствам по умолчанию пропущен",
+                exc_info=True,
+            )
+
+        self._select_by_candidates(self.mic_combo, saved_mic, default_mic)
+        self._select_by_candidates(self.loopback_combo, saved_loopback, default_loopback)
+
+    @staticmethod
+    def _select_by_candidates(combo: QComboBox, *candidates: object) -> None:
+        """Select the first non-None candidate found among the combo's
+        itemData entries; leave the selection untouched when none matches."""
+        for candidate in candidates:
+            if candidate is None:
+                continue
+            for index in range(combo.count()):
+                if combo.itemData(index) == candidate:
+                    combo.setCurrentIndex(index)
+                    return
 
     # -- helpers ----------------------------------------------------------
 
@@ -691,6 +765,23 @@ class MainWindow(QMainWindow):
             self._import_path = Path(path_str)
             self._update_import_file_label()
             self.statusBar().showMessage(f"Выбран файл: {self._import_path.name}")
+
+    def _on_device_changed(self) -> None:
+        """Persist the device choice on a real user change of either combo.
+
+        Programmatic changes (the initial populate/preselect in
+        `_populate_devices`) run with signals blocked, so this slot only
+        fires for user actions. Placeholder items (itemData is None) are
+        never saved.
+        """
+        mic_name = self.mic_combo.currentData()
+        loopback_name = self.loopback_combo.currentData()
+        if mic_name is None or loopback_name is None:
+            return
+        try:
+            save_device_prefs(mic_name, loopback_name)
+        except Exception:  # noqa: BLE001 - saving must never break the GUI
+            logger.warning("Не удалось сохранить выбор устройств", exc_info=True)
 
     def _on_start_clicked(self) -> None:
         # Local import: by this point `app.gui.worker` is already cached in
