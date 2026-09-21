@@ -50,6 +50,10 @@ def chat(client, llm: LLMSettings, system: str, user: str) -> str:
             {"role": "system", "content": system},
             {"role": "user", "content": user},
         ],
+        reasoning_effort="medium",
+        extra_body={ 
+            "allowed_openai_params": ["reasoning_effort"]
+        },
     )
     if not resp.choices:
         raise RuntimeError("LLM вернул пустой ответ (нет choices).")
