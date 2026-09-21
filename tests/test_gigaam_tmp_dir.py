@@ -12,7 +12,15 @@ verifies, without the real model:
 - transcription errors (from `sf.write` or `model.transcribe`) propagate
   with the temp file's FULL PATH embedded in the message — the session
   worker logs only the exception's str, so that line must be
-  self-diagnosable.
+  self-diagnosable;
+- the ffmpeg-in-PATH requirement: construction fails fast with
+  GigaAMDependencyError when ffmpeg is missing, and a FileNotFoundError
+  from `model.transcribe()` (ffmpeg vanished mid-run) is remapped to an
+  explicit ffmpeg error WITHOUT the "(temp WAV: ...)" suffix.
+
+The engine's `shutil.which("ffmpeg")` check is monkeypatched (autouse
+fixture) so the tests are independent of whether ffmpeg is installed on
+the test machine.
 """
 
 from __future__ import annotations
@@ -43,6 +51,20 @@ class _FakeModel:
         if self.error is not None:
             raise self.error
         return self.text
+
+
+@pytest.fixture(autouse=True)
+def fake_ffmpeg_on_path(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Make the engine's ffmpeg-in-PATH check platform-independent.
+
+    Without this, every test constructing GigaAMEngine would depend on
+    whether ffmpeg happens to be installed on the test machine.
+    """
+    monkeypatch.setattr(
+        gigaam_mod.shutil,
+        "which",
+        lambda name: "/fake/ffmpeg" if name == "ffmpeg" else None,
+    )
 
 
 @pytest.fixture()
@@ -139,6 +161,47 @@ def test_fallback_when_work_dir_uncreatable(tmp_path, fake_model):
 
 def test_model_error_message_contains_full_temp_path(tmp_path, fake_model):
     work_dir = _ascii_work_dir(tmp_path)
+    # A NON-FileNotFoundError: that one keeps the "(temp WAV: ...)" suffix
+    # (the FileNotFoundError case is remapped to the ffmpeg error — see
+    # test_model_file_not_found_maps_to_ffmpeg_error).
+    fake_model.error = ValueError("unsupported audio format")
+    engine = _make_engine(work_dir)
+
+    with pytest.raises(RuntimeError) as excinfo:
+        engine.transcribe(_one_second())
+
+    msg = str(excinfo.value)
+    seen = fake_model.seen_paths[0]
+    assert seen in msg  # full temp path -> diagnosable from the log line
+    assert "(temp WAV:" in msg
+    assert "unsupported audio format" in msg
+    assert isinstance(excinfo.value.__cause__, ValueError)
+
+
+def test_missing_ffmpeg_fails_fast_before_model_load(monkeypatch):
+    import transformers
+
+    monkeypatch.setattr(gigaam_mod.shutil, "which", lambda name: None)
+
+    def _no_load(*args, **kwargs):
+        raise AssertionError("model must not be loaded when ffmpeg is missing")
+
+    monkeypatch.setattr(
+        transformers.AutoModel, "from_pretrained", staticmethod(_no_load)
+    )
+
+    with pytest.raises(gigaam_mod.GigaAMDependencyError) as excinfo:
+        _make_engine(None)
+
+    msg = str(excinfo.value)
+    assert "ffmpeg" in msg
+    assert "winget install Gyan.FFmpeg" in msg
+
+
+def test_model_file_not_found_maps_to_ffmpeg_error(tmp_path, fake_model):
+    # ffmpeg vanished from PATH mid-run: the remote code's load_audio()
+    # subprocess cannot find the executable -> FileNotFoundError.
+    work_dir = _ascii_work_dir(tmp_path)
     fake_model.error = FileNotFoundError(
         "[WinError 2] Не удается найти указанный файл"
     )
@@ -148,9 +211,8 @@ def test_model_error_message_contains_full_temp_path(tmp_path, fake_model):
         engine.transcribe(_one_second())
 
     msg = str(excinfo.value)
-    seen = fake_model.seen_paths[0]
-    assert seen in msg  # full temp path -> diagnosable from the log line
-    assert "[WinError 2]" in msg
+    assert "ffmpeg" in msg
+    assert "(temp WAV:" not in msg  # the suffix would blame the WAV
     assert isinstance(excinfo.value.__cause__, FileNotFoundError)
 
 

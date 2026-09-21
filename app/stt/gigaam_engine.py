@@ -5,11 +5,14 @@ trust_remote_code=True)`. `model.transcribe(path)` takes a FILE PATH, so each
 numpy segment is written to a temporary 16 kHz WAV, transcribed, then deleted.
 
 The temp WAV lives in a dedicated directory (`work_dir`, threaded in by the
-factory) rather than the system tempdir: GigaAM's remote code opens the path
-through non-Unicode-safe Win32 APIs, so a non-ASCII path (a Cyrillic Windows
-username in %TEMP%) makes the model fail to open a file we just wrote
-([WinError 2]). The engine validates the resolved path is ASCII-only and
-degrades to the system tempdir when no usable dir is given.
+factory) rather than the system tempdir. The engine validates the resolved
+path is ASCII-only and degrades to the system tempdir when no usable dir is
+given. The ASCII policy is kept as a DEFENSIVE measure: the field [WinError 2]
+failure was first attributed to a non-ASCII path (a Cyrillic Windows username
+in %TEMP%) opened through non-Unicode-safe Win32 APIs, but the CONFIRMED cause
+is a missing ffmpeg binary (see below) — and a subprocess with list arguments
+goes through CreateProcessW on Windows, so a Cyrillic path is probably not a
+problem at all.
 
 GigaAM-v3's short-form `model.transcribe()` rejects clips over ~30 s ("Too long
 wav file, use 'transcribe_longform' method."). `transcribe_longform` is NOT used
@@ -19,11 +22,19 @@ transcribed via the SHORT-form `transcribe()` and joined in chronological order.
 
 GigaAM needs extra dependencies (install with `uv sync --extra gigaam`). If they
 are missing, constructing this engine raises a clear, catchable error.
+
+GigaAM also requires `ffmpeg` on PATH as a hard runtime dependency: its remote
+code (`load_audio` in `modeling_gigaam.py`) decodes the temp WAV by shelling
+out to an `ffmpeg` subprocess. The engine checks for ffmpeg at construction
+(fail-fast, before the multi-second model load) and maps a missing ffmpeg at
+transcription time to a clear user-facing error (a missing ffmpeg binary
+surfaces as `FileNotFoundError`/[WinError 2] — about the binary, NOT the WAV).
 """
 
 from __future__ import annotations
 
 import os
+import shutil
 import tempfile
 import time
 from pathlib import Path
@@ -42,6 +53,15 @@ logger = get_logger("stt.gigaam")
 # GigaAM-v3's ~30 s hard limit so a marginally-over clip (resampling jitter,
 # off-by-a-frame) never trips the "Too long wav file" error.
 _MAX_TRANSCRIBE_SECONDS = 24.0
+
+# User-facing hint for the missing-ffmpeg case (construction-time
+# GigaAMDependencyError and mid-session RuntimeError share it).
+_FFMPEG_HINT = (
+    "GigaAM требует ffmpeg в PATH: его remote-код декодирует временный WAV "
+    "через ffmpeg-подпроцесс. Установите ffmpeg, например "
+    "`winget install Gyan.FFmpeg` (или https://www.gyan.dev/ffmpeg/builds/), "
+    "затем перезапустите приложение."
+)
 
 # `max_duration` handed to the internal slicing segmenter. ContinuousSegmenter
 # hard-splits continuous speech at `max_frames = int(max_duration*1000/frame_ms)`
@@ -145,6 +165,13 @@ class GigaAMEngine:
         # to the fallback at engine construction, not mid-session.
         self._tmp_dir = _resolve_tmp_dir(work_dir)
 
+        # Fail fast, BEFORE the multi-second model load: GigaAM's remote code
+        # decodes the temp WAV via an ffmpeg subprocess, so a missing ffmpeg
+        # would otherwise surface mid-session as a cryptic
+        # FileNotFoundError([WinError 2]) about the "WAV".
+        if shutil.which("ffmpeg") is None:
+            raise GigaAMDependencyError(_FFMPEG_HINT)
+
         try:
             from transformers import AutoModel
         except Exception as exc:  # pragma: no cover - transformers is a base dep
@@ -204,17 +231,38 @@ class GigaAMEngine:
         session worker logs only the exception's str — a field failure (AV
         interference in %TEMP%, a broken path, ...) must be diagnosable from
         that single log line.
+
+        Exception: a `FileNotFoundError` from `model.transcribe()` is remapped
+        to an explicit ffmpeg-in-PATH error WITHOUT the "(temp WAV: ...)"
+        suffix — GigaAM's remote code shells out to `ffmpeg`, so the missing
+        file is the ffmpeg binary, and the suffix would point the field
+        diagnosis at the wrong file.
         """
         fd, tmp_path = tempfile.mkstemp(
             suffix=".wav", prefix="gigaam_", dir=self._tmp_dir
         )
         os.close(fd)
         try:
-            sf.write(tmp_path, audio, self.sample_rate, subtype="PCM_16")
-            result = self.model.transcribe(tmp_path)
+            try:
+                sf.write(tmp_path, audio, self.sample_rate, subtype="PCM_16")
+            except Exception as exc:
+                raise RuntimeError(f"{exc} (temp WAV: {tmp_path})") from exc
+            try:
+                result = self.model.transcribe(tmp_path)
+            except FileNotFoundError as exc:
+                # ASSUMPTION: the missing file is the ffmpeg binary (the
+                # remote code's load_audio() subprocess cannot find it).
+                # The alternative cause — a non-ASCII temp WAV path (a mode
+                # the engine already logs ERROR for in
+                # _warn_if_system_tempdir_non_ascii) — is speculative: a
+                # subprocess with list arguments goes through CreateProcessW
+                # on Windows, so a Cyrillic path is probably fine.
+                raise RuntimeError(
+                    _FFMPEG_HINT + f" Исходная ошибка: {exc}"
+                ) from exc
+            except Exception as exc:
+                raise RuntimeError(f"{exc} (temp WAV: {tmp_path})") from exc
             return self._extract_text(result).strip()
-        except Exception as exc:
-            raise RuntimeError(f"{exc} (temp WAV: {tmp_path})") from exc
         finally:
             try:
                 os.remove(tmp_path)
