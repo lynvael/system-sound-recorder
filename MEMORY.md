@@ -298,6 +298,19 @@ tests. See "Верификация" in `kind-hatching-allen.md`.
 - **New base deps**: `openai` (LLM client) and `python-docx` (`.docx` export) —
   both in `pyproject.toml` base `dependencies`, so plain `uv sync` installs them
   (no extra needed).
+- **Chunking degeneration fix (2026-09-25).** Old `chunk_text` assumed no line
+  exceeds `chunk_chars`; a merged same-speaker monologue (9897/24127 chars in
+  real sessions) made `rfind("\n")` keep finding the PREVIOUS line's newline,
+  `end` stuck, `start` crawled +1/iter → ~`overlap` (400) nearly-identical
+  garbage chunks (vtb_broken: 407 instead of 7; 24k session: 817). Fix =
+  (a) guard in `chunk_text`: newline accepted only if `nl - overlap > start`,
+  else the (previously unreachable) hard cut; (b) `merge_consecutive(segments,
+  max_chars=None)` — pipeline passes `llm.chunk_chars` so long monologues split
+  at turn boundaries. IMPORTANT: the merge limit ALONE does not fix the
+  degeneration (two consecutive ~8000-char lines still trigger the crawl —
+  verified by simulation); the guard is the actual fix, the limit is a cut
+  quality improvement. The `"[mm:ss] Speaker: "` render prefix is NOT counted
+  in the limit (safe: guard covers it). Tests: `tests/test_summarize_chunking.py`.
 - **All failures wrapped in `SummarizationError`** (Russian-language message,
   defined in `app/summarize/pipeline.py`) — missing/empty/malformed transcript,
   LLM/transport errors, and docx save failures (e.g. file open in Word on
@@ -336,3 +349,16 @@ GPU opt-in. Run: `python -m app` (GUI), `python -m app.cli {list-devices,transcr
 ## Goals
 - (2026-09-21) (2026-09-21) Верифицировать на Windows (нет в dev-окружении): (1) на старте GUI предвыбираются дефолтные устройства (микрофон + loopback вывода по умолчанию, маркеры в list-devices); (2) ручной выбор combo сохраняется между запусками (HKCU\Software\LiveRecorder\LiveRecorder) и бьёт авто-предвыбор; (3) get_default_*_device_info() PyAudioWPatch реально возвращают dict с isLoopbackDevice (допущение, покрыто только фейками).
 - (2026-09-21) После миграции ADR-001 (2026-09-21) аудио-захват снова не верифицирован на железе: выполнить чек-лист ADR п.1–11 на Windows с Jabra Evolve2 30 SE; п.1 (Jabra открывается без AssertionError в paFloat32 на defaultSampleRate) — первый и главный шаг, митигция R1 — is_format_supported() перед open().
+
+## Summary experiments (summary_tests/, 2026-09-25)
+- Three self-contained summarization strategies for long transcripts: `map_reduce/`,
+  `eacss/` (extractive via embeddings+k-means → abstractive LLM),
+  `hierarchical_context/` (Context-Aware Hierarchical Merging, Extract-Support variant,
+  Ou & Lapata ACL 2025). Input: .txt or transcript.json; output: output/<name>.md.
+- **FrankAI LLM is unusably slow without `reasoning_effort="medium"`** passed via
+  `extra_body={"allowed_openai_params": ["reasoning_effort"]}` on every
+  chat.completions.create (~60-90s+ per call without it, ~25-35s with). Any new LLM
+  call in this project MUST include it.
+- Extractive phases use a REMOTE OpenAI-compatible embeddings endpoint (env
+  `EMBED_URL`/`EMBED_API_KEY`/`EMBED_MODEL`) — user provisions it on demand; no local
+  BERT/rerank models are installed. Chunk size 32000 chars (~8K tokens, per ACL 2025).

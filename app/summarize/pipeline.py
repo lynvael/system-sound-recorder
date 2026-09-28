@@ -128,10 +128,12 @@ def run_summarization(
 
     _notify(on_status, "Саммаризация: чтение стенограммы…")
     segments = _load_segments(session_dir / "transcript.json")
-    merged = merge_consecutive(segments)
+    llm = config.llm
+    # Cap merged line length at the chunk budget so chunk_text splits long
+    # monologues at turn boundaries instead of hard-cutting mid-sentence.
+    merged = merge_consecutive(segments, max_chars=llm.chunk_chars)
 
     text = build_transcript_text(merged)
-    llm = config.llm
     chunks = chunk_text(text, llm.chunk_chars, llm.chunk_overlap)
     if not chunks:
         raise SummarizationError("После обработки стенограммы не осталось текста.")
@@ -165,7 +167,6 @@ def run_summarization(
                     prompts.SYSTEM,
                     prompts.MAP_INSTRUCTIONS.format(index=i, total=total, chunk=chunk),
                 )
-                print(f"result: ${result}")
                 chunk_summaries.append(result)
             _notify(on_status, "Сборка итогового отчёта…")
             joined = "\n\n---\n\n".join(chunk_summaries)
