@@ -36,6 +36,10 @@ from typing import Optional
 
 from PySide6.QtCore import QObject, Signal, Slot
 
+from app.log import get_logger
+
+logger = get_logger("gui.worker")
+
 # --- shared contract with the backend (app/pipeline/, app/config.py) -------
 # TODO(reconcile-with-backend): these imports assume the backend engineer's
 # final module/class names exactly match kind-hatching-allen.md. If a name
@@ -108,13 +112,17 @@ class SessionWorker(QObject):
 
     # -- on-demand summarization (independent of the live Session above) --
     summarize_status = Signal(str)
-    summarize_done = Signal(object)  # Path to summary.docx
+    summarize_done = Signal(object)  # Path to the report docx
     summarize_failed = Signal(str)
+    summarize_cancelled = Signal()  # run aborted via cancel_event; no report written
 
     def __init__(self, parent: Optional[QObject] = None) -> None:
         super().__init__(parent)
         self._session: Optional[Session] = None
-        self._summarize_lock = threading.Lock()
+        # Set in the `summarize` slot (worker QThread), cleared in the
+        # summarize daemon thread's `finally` -- plain attribute access is
+        # atomic under the GIL, and the check-then-set in the slot is
+        # single-threaded (one worker event loop), so no lock is needed.
         self._summarizing = False
 
     @Slot(object)
@@ -210,10 +218,29 @@ class SessionWorker(QObject):
         self.error.emit(message)
 
     # -- on-demand summarization ------------------------------------------
-    @Slot(object)
-    def summarize(self, session_dir) -> None:
+    def _safe_emit(self, signal, *args) -> None:
+        """Emit `signal` from the summarize daemon thread, tolerating the
+        worker QObject having been deleted in the meantime (window closed
+        while a run is in flight). Emitting into a deleted C++ object
+        raises RuntimeError; the run is over from the GUI's point of view
+        anyway, so dropping the signal is the correct behaviour.
+        """
+        try:
+            signal.emit(*args)
+        except RuntimeError:
+            logger.debug(
+                "Сигнал саммаризации пропущен: worker уже удалён", exc_info=True
+            )
+
+    @Slot(object, object, object)
+    def summarize(self, session_dir, options, cancel_event) -> None:
         """Run summarization over `session_dir` on a daemon background thread.
 
+        `options` is a `app.summarize.SummarizationOptions` (or None).
+        `cancel_event` is a `threading.Event` created by the GUI at click
+        time and passed through the queued `request_summarize` signal --
+        the GUI cancels by calling `cancel_event.set()` directly, so the
+        abort can never be lost behind this slot's queueing here.
         This slot itself runs on the worker `QThread` (queued from the GUI),
         but `run_summarization` does network/LLM I/O that can take a while,
         so it must not block this thread's own event loop (the STT
@@ -224,11 +251,20 @@ class SessionWorker(QObject):
         thread the connected slot lives on (the GUI thread) -- see the
         module docstring.
         """
-        with self._summarize_lock:
-            if self._summarizing:
-                self.summarize_failed.emit("Саммаризация уже выполняется.")
-                return
-            self._summarizing = True
+        if self._summarizing:
+            # Log-only: the GUI's button is disabled while a run is in
+            # flight, so this is unreachable in normal use -- and emitting
+            # `summarize_failed` here would wrongly clear the GUI's
+            # in-progress state (delete guard) for the FIRST run.
+            logger.warning("Саммаризация уже выполняется — повторный запуск пропущен.")
+            return
+        if cancel_event.is_set():
+            # The run was cancelled before this queued slot even got to run
+            # (e.g. the window was closed): report the abort without
+            # calling the backend at all.
+            self._safe_emit(self.summarize_cancelled)
+            return
+        self._summarizing = True
 
         def _run() -> None:
             try:
@@ -236,19 +272,38 @@ class SessionWorker(QObject):
                 # import-time surface (symmetry with the lazy audio-backend
                 # imports elsewhere in the GUI layer; also avoids paying
                 # for the LLM client import until it's actually used).
-                from app.summarize import run_summarization
+                from app.summarize import SummarizationCancelled, run_summarization
 
                 config = load_app_config()
                 path = run_summarization(
-                    session_dir, config, on_status=self.summarize_status.emit
+                    session_dir,
+                    config,
+                    on_status=lambda status: self._safe_emit(
+                        self.summarize_status, status
+                    ),
+                    options=options,
+                    cancel_event=cancel_event,
                 )
+                outcome = ("done", path)
+            except SummarizationCancelled:
+                # Caught BEFORE the generic Exception below (it subclasses
+                # SummarizationError): a user-requested abort is a neutral
+                # outcome, not a failure -- no report is written.
+                outcome = ("cancelled", None)
             except Exception as exc:  # noqa: BLE001 - surface any failure to the GUI
-                self.summarize_failed.emit(str(exc))
-            else:
-                self.summarize_done.emit(path)
+                outcome = ("failed", str(exc))
             finally:
-                with self._summarize_lock:
-                    self._summarizing = False
+                # Reset BEFORE emitting: the GUI re-enables the summarize
+                # button in the done/failed/cancelled handlers, and a
+                # second click must not be rejected as "already running".
+                self._summarizing = False
+            kind, payload = outcome
+            if kind == "cancelled":
+                self._safe_emit(self.summarize_cancelled)
+            elif kind == "failed":
+                self._safe_emit(self.summarize_failed, payload)
+            else:
+                self._safe_emit(self.summarize_done, payload)
 
         threading.Thread(
             target=_run, name="summarize-worker", daemon=True

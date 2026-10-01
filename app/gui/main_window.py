@@ -14,6 +14,7 @@ from __future__ import annotations
 import json
 import shutil
 import sys
+import threading
 from datetime import datetime
 from pathlib import Path
 from typing import Optional
@@ -42,7 +43,25 @@ from PySide6.QtWidgets import (
 )
 
 from app.log import get_logger
-from app.gui.prefs import load_device_prefs, save_device_prefs
+from app.gui.prefs import (
+    SummarizePrefs,
+    load_device_prefs,
+    load_summarize_prefs,
+    resolve_options,
+    save_device_prefs,
+    save_summarize_prefs,
+)
+from app.gui.prompt_dialog import edit_report_prompt
+
+# app.summarize is Qt-free and cheap to import at module level (unlike the
+# audio backend, which must stay lazy -- see the NOTE below). The names
+# below are the fixed public contract of ADR-002.
+from app.summarize import (
+    DEFAULT_REPORT_PROMPT,
+    DEFAULT_STRATEGY_ID,
+    STRATEGIES,
+    find_latest_summary,
+)
 
 logger = get_logger("gui.main_window")
 
@@ -105,7 +124,8 @@ class MainWindow(QMainWindow):
     # app/gui/worker.py docstring) -- the UI thread is never blocked.
     request_start = Signal(object)  # SessionParams
     request_stop = Signal()
-    request_summarize = Signal(object)  # Path to session dir
+    # (Path to session dir, SummarizationOptions, threading.Event for cancel)
+    request_summarize = Signal(object, object, object)
 
     def __init__(self) -> None:
         super().__init__()
@@ -128,6 +148,11 @@ class MainWindow(QMainWindow):
         self._elapsed_start: Optional[datetime] = None
 
         self._summarizing_dir: Optional[Path] = None
+        # The in-flight run's cancel event, owned by the GUI: created at
+        # click time, passed to the worker through `request_summarize`, and
+        # set directly on «Отменить»/window close -- so a cancel can never
+        # be lost behind the worker QThread's event loop.
+        self._summarize_cancel_event: Optional[threading.Event] = None
         self._current_backlog = 0
 
         # `app.config` does not touch the audio backend (unlike app.gui.worker
@@ -135,15 +160,23 @@ class MainWindow(QMainWindow):
         # kept as a local, best-effort import here in case the backend
         # config module isn't importable yet (mirrors the graceful
         # degradation used elsewhere in this file).
+        # Whether the remote embeddings endpoint (EMBED_*) is configured:
+        # decides which summarization methods are selectable (see
+        # `_populate_strategies`). Read once at startup; changing .env
+        # requires a restart (documented ADR-002 trade-off).
+        self._embed_configured = False
         try:
             from app.config import load_config
 
-            self._recordings_root = Path(load_config().session.output_dir)
+            config = load_config()
+            self._recordings_root = Path(config.session.output_dir)
+            self._embed_configured = bool(config.embed.is_configured)
         except Exception:  # noqa: BLE001 - degrade gracefully
             self._recordings_root = Path("recordings")
 
         self._build_ui()
         self._populate_devices()
+        self._populate_strategies()
         self._update_mode_dependent_widgets()
         self._refresh_session_list()
 
@@ -173,6 +206,7 @@ class MainWindow(QMainWindow):
         self._worker.summarize_status.connect(self._on_summarize_status)
         self._worker.summarize_done.connect(self._on_summarize_done)
         self._worker.summarize_failed.connect(self._on_summarize_failed)
+        self._worker.summarize_cancelled.connect(self._on_summarize_cancelled)
 
     # -- UI construction ------------------------------------------------
 
@@ -331,6 +365,25 @@ class MainWindow(QMainWindow):
             info_grid.addWidget(widget, row_idx, 1)
         layout.addLayout(info_grid)
 
+        # -- summarization options (populated in `_populate_strategies`) ----
+        strategy_row = QHBoxLayout()
+        strategy_row.addWidget(QLabel("Метод:", panel))
+        self.strategy_combo = QComboBox(panel)
+        strategy_row.addWidget(self.strategy_combo, stretch=1)
+        layout.addLayout(strategy_row)
+
+        self.default_prompt_check = QCheckBox(
+            "Использовать промпт по умолчанию", panel
+        )
+        self.default_prompt_check.setChecked(True)
+        self.default_prompt_check.setToolTip(
+            "Встроенный формат: TL;DR, решения, задачи, темы, открытые вопросы"
+        )
+        layout.addWidget(self.default_prompt_check)
+
+        self.prompt_button = QPushButton("Промпт отчёта…", panel)
+        layout.addWidget(self.prompt_button)
+
         # -- summarization progress -----------------------------------------
         self.summarize_progress = QProgressBar(panel)
         self.summarize_progress.setRange(0, 0)  # indeterminate
@@ -345,6 +398,14 @@ class MainWindow(QMainWindow):
         self.summarize_button = QPushButton("Саммаризация", panel)
         self.summarize_button.setEnabled(False)
         layout.addWidget(self.summarize_button)
+
+        # Visible only while a summarization is running (see
+        # `_update_action_buttons`); aborts it by setting the run's cancel
+        # event directly (owned by the GUI -- see `__init__`).
+        self.cancel_summarize_button = QPushButton("Отменить", panel)
+        self.cancel_summarize_button.setEnabled(False)
+        self.cancel_summarize_button.setVisible(False)
+        layout.addWidget(self.cancel_summarize_button)
 
         self.open_report_button = QPushButton("Открыть отчёт", panel)
         self.open_report_button.setEnabled(False)
@@ -370,7 +431,14 @@ class MainWindow(QMainWindow):
 
         self.session_combo.currentIndexChanged.connect(self._on_session_selected)
         self.refresh_sessions_button.clicked.connect(self._on_refresh_sessions_clicked)
+        # Summarization option persistence: fires only on REAL user changes
+        # -- the initial preselect in `_populate_strategies` runs with
+        # signals blocked (same pattern as the device combos).
+        self.strategy_combo.currentIndexChanged.connect(self._on_strategy_changed)
+        self.default_prompt_check.toggled.connect(self._on_default_prompt_toggled)
+        self.prompt_button.clicked.connect(self._on_prompt_button_clicked)
         self.summarize_button.clicked.connect(self._on_summarize_clicked)
+        self.cancel_summarize_button.clicked.connect(self._on_cancel_summarize_clicked)
         self.open_report_button.clicked.connect(self._on_open_report_clicked)
         self.open_folder_button.clicked.connect(self._on_open_folder_clicked)
         self.open_transcript_button.clicked.connect(self._on_open_transcript_clicked)
@@ -479,6 +547,57 @@ class MainWindow(QMainWindow):
                 if combo.itemData(index) == candidate:
                     combo.setCurrentIndex(index)
                     return
+
+    def _populate_strategies(self) -> None:
+        """Fill the method combo from ``STRATEGIES`` and preselect prefs.
+
+        Methods with ``requires_embeddings`` are shown DISABLED (greyed,
+        with a tooltip) when the ``EMBED_*`` config is not set. The whole
+        populate+preselect block runs with signals blocked, so only real
+        user changes trigger the save slot. A saved id that is unknown or
+        currently unavailable (embeddings not configured) falls back to
+        ``DEFAULT_STRATEGY_ID`` WITHOUT overwriting the stored value --
+        the user's choice survives re-adding ``EMBED_*``.
+        """
+        saved = None
+        try:
+            stored = load_summarize_prefs()
+            saved = stored.strategy
+            use_default = stored.use_default_prompt
+        except Exception:  # noqa: BLE001 - prefs must never break startup
+            logger.warning("Не удалось прочитать настройки саммаризации", exc_info=True)
+            use_default = True
+
+        self.strategy_combo.blockSignals(True)
+        self.default_prompt_check.blockSignals(True)
+        try:
+            self.strategy_combo.clear()
+            saved_index = -1
+            saved_enabled = False
+            default_index = 0
+            for index, (strategy_id, info) in enumerate(STRATEGIES.items()):
+                self.strategy_combo.addItem(info.label, strategy_id)
+                if strategy_id == DEFAULT_STRATEGY_ID:
+                    default_index = index
+                if strategy_id == saved:
+                    saved_index = index
+                enabled = not (info.requires_embeddings and not self._embed_configured)
+                if not enabled:
+                    # Grey out the item and explain why (the popup list
+                    # renders it disabled; the user cannot pick it).
+                    item = self.strategy_combo.model().item(index)
+                    item.setEnabled(False)
+                    item.setToolTip("Требуется настройка EMBED_URL / EMBED_MODEL в .env")
+                if strategy_id == saved:
+                    saved_enabled = enabled
+            if saved_index >= 0 and saved_enabled:
+                self.strategy_combo.setCurrentIndex(saved_index)
+            else:
+                self.strategy_combo.setCurrentIndex(default_index)
+            self.default_prompt_check.setChecked(use_default)
+        finally:
+            self.strategy_combo.blockSignals(False)
+            self.default_prompt_check.blockSignals(False)
 
     # -- helpers ----------------------------------------------------------
 
@@ -722,7 +841,11 @@ class MainWindow(QMainWindow):
         has_transcript = (
             session_dir is not None and (session_dir / "transcript.json").exists()
         )
-        has_report = session_dir is not None and (session_dir / "summary.docx").exists()
+        # Reports are `summary_<method>_<YYYYMMDD_HHMMSS>.docx` (the legacy
+        # `summary.docx` also counts) -- enable when the newest one exists.
+        has_report = (
+            session_dir is not None and find_latest_summary(session_dir) is not None
+        )
         has_transcript_txt = (
             session_dir is not None and (session_dir / "transcript.txt").exists()
         )
@@ -730,6 +853,14 @@ class MainWindow(QMainWindow):
         self.summarize_button.setEnabled(
             has_transcript and not is_active_recording and not any_summarizing
         )
+        # Method/prompt controls are frozen while a run is in flight: the
+        # options are captured at click time, so mid-run changes would be
+        # silently ignored and misleading.
+        self.strategy_combo.setEnabled(not any_summarizing)
+        self.default_prompt_check.setEnabled(not any_summarizing)
+        self.prompt_button.setEnabled(not any_summarizing)
+        self.cancel_summarize_button.setVisible(any_summarizing)
+        self.cancel_summarize_button.setEnabled(any_summarizing)
         self.open_report_button.setEnabled(has_report)
         self.open_folder_button.setEnabled(
             session_dir is not None and session_dir.exists()
@@ -845,8 +976,10 @@ class MainWindow(QMainWindow):
         session_dir = self._selected_session_dir()
         if session_dir is None:
             return
-        report = session_dir / "summary.docx"
-        if not report.exists():
+        # Reports are `summary_<method>_<YYYYMMDD_HHMMSS>.docx` (the legacy
+        # `summary.docx` also counts) -- always open the NEWEST one.
+        report = find_latest_summary(session_dir)
+        if report is None:
             self.statusBar().showMessage("Отчёт ещё не создан.", 3000)
             return
         QDesktopServices.openUrl(QUrl.fromLocalFile(str(report)))
@@ -889,7 +1022,7 @@ class MainWindow(QMainWindow):
             self._show_error(f"Нельзя удалить сеанс, пока идёт {verb}.")
             return
         if session_dir == self._summarizing_dir:
-            # rmtree would race the summarize daemon writing summary.docx here.
+            # rmtree would race the summarize daemon writing the report docx here.
             self._show_error("Нельзя удалить сеанс, пока идёт саммаризация.")
             return
         reply = QMessageBox.question(
@@ -918,18 +1051,107 @@ class MainWindow(QMainWindow):
         self._update_session_info()
         self._update_action_buttons()
 
+    # -- summarization options (method / prompt) ---------------------------
+
+    def _collect_summarize_prefs(self) -> SummarizePrefs:
+        """Current widget state + the stored custom text.
+
+        The custom text is only ever changed by the prompt dialog (which
+        writes it straight to prefs), so it is read back from prefs here
+        rather than kept in a widget.
+        """
+        stored = load_summarize_prefs()
+        strategy_id = self.strategy_combo.currentData()
+        return SummarizePrefs(
+            strategy=(
+                strategy_id
+                if isinstance(strategy_id, str) and strategy_id
+                else stored.strategy
+            ),
+            use_default_prompt=self.default_prompt_check.isChecked(),
+            custom_prompt=stored.custom_prompt,
+        )
+
+    def _persist_summarize_prefs(self) -> None:
+        try:
+            save_summarize_prefs(self._collect_summarize_prefs())
+        except Exception:  # noqa: BLE001 - saving must never break the GUI
+            logger.warning("Не удалось сохранить настройки саммаризации", exc_info=True)
+
+    def _on_strategy_changed(self, _index: int = -1) -> None:
+        # Fires only on a real user change (preselect runs with signals
+        # blocked). The stored value is NOT overwritten when the combo
+        # holds a placeholder/empty selection.
+        if not isinstance(self.strategy_combo.currentData(), str):
+            return
+        self._persist_summarize_prefs()
+
+    def _on_default_prompt_toggled(self, _checked: bool) -> None:
+        # Toggling NEVER deletes the stored custom text -- it only decides
+        # whether that text is used.
+        self._persist_summarize_prefs()
+
+    def _on_prompt_button_clicked(self) -> None:
+        stored = load_summarize_prefs()
+        # Empty stored text: pre-fill the built-in default prompt as a
+        # starting template for editing.
+        initial = stored.custom_prompt if stored.custom_prompt else DEFAULT_REPORT_PROMPT
+        text = edit_report_prompt(self, initial)
+        if text is None:
+            return  # cancelled -- nothing changes
+        prefs = self._collect_summarize_prefs()
+        prefs.custom_prompt = text
+        # NOTE: the "использовать промпт по умолчанию" checkbox is
+        # deliberately NOT toggled here -- no hidden side effects.
+        try:
+            save_summarize_prefs(prefs)
+        except Exception:  # noqa: BLE001 - saving must never break the GUI
+            logger.warning("Не удалось сохранить настройки саммаризации", exc_info=True)
+
+    # -- summarization run ---------------------------------------------------
+
     def _on_summarize_clicked(self) -> None:
         session_dir = self._selected_session_dir()
         if session_dir is None:
             return
+        use_default = self.default_prompt_check.isChecked()
+        custom_text = load_summarize_prefs().custom_prompt
+        if not use_default and not custom_text.strip():
+            QMessageBox.warning(
+                self,
+                "Саммаризация",
+                "Свой промпт пуст: заполните «Промпт отчёта…» "
+                "или включите промпт по умолчанию.",
+            )
+            return
+        options = resolve_options(
+            self.strategy_combo.currentData(), use_default, custom_text
+        )
+        # The cancel event is created HERE (GUI thread, at click time) and
+        # passed through the queued signal -- creating it inside the
+        # worker's slot would lose a cancel that arrives before that slot
+        # runs (e.g. while the worker thread is busy with a batch pass).
+        cancel_event = threading.Event()
         self._summarizing_dir = session_dir
+        self._summarize_cancel_event = cancel_event
         self.summarize_progress.setVisible(True)
         self.summarize_status_label.setVisible(True)
         self.summarize_status_label.setText("Запуск саммаризации…")
         self._update_action_buttons()
         self._update_session_info()
         self._log(f"Саммаризация запущена: {session_dir}")
-        self.request_summarize.emit(session_dir)
+        self.request_summarize.emit(session_dir, options, cancel_event)
+
+    def _on_cancel_summarize_clicked(self) -> None:
+        # Idempotent: the event may already be set; the button stays
+        # visible/enabled until the worker reports the run over (see
+        # `_on_summarize_cancelled` / done / failed). `threading.Event.set()`
+        # is thread-safe and non-blocking, so this runs straight on the GUI
+        # thread -- no signal round-trip to the worker needed.
+        event = self._summarize_cancel_event
+        if event is not None:
+            event.set()
+        self.statusBar().showMessage("Отмена саммаризации…", 3000)
 
     def _on_elapsed_tick(self) -> None:
         if self._elapsed_start is None or self._active_session_dir is None:
@@ -1011,6 +1233,7 @@ class MainWindow(QMainWindow):
     def _on_summarize_done(self, path) -> None:
         self._log(f"Саммаризация завершена: {path}")
         self._summarizing_dir = None
+        self._summarize_cancel_event = None
         self.summarize_progress.setVisible(False)
         self.summarize_status_label.setVisible(False)
         self._update_action_buttons()
@@ -1019,6 +1242,7 @@ class MainWindow(QMainWindow):
     def _on_summarize_failed(self, message: str) -> None:
         self._log(f"Ошибка саммаризации: {message}")
         self._summarizing_dir = None
+        self._summarize_cancel_event = None
         self.summarize_progress.setVisible(False)
         self.summarize_status_label.setVisible(False)
         self._update_action_buttons()
@@ -1029,6 +1253,20 @@ class MainWindow(QMainWindow):
             self, "Саммаризация", f"Не удалось выполнить саммаризацию:\n\n{message}"
         )
 
+    def _on_summarize_cancelled(self) -> None:
+        # A user-requested abort is a NEUTRAL outcome, not an error: no
+        # dialog, just a status-bar note. The delete guard
+        # (`_summarizing_dir`) stays set until this signal (or done/failed)
+        # arrives, so it is cleared here.
+        self._log("Саммаризация отменена.")
+        self.statusBar().showMessage("Саммаризация отменена.", 5000)
+        self._summarizing_dir = None
+        self._summarize_cancel_event = None
+        self.summarize_progress.setVisible(False)
+        self.summarize_status_label.setVisible(False)
+        self._update_action_buttons()
+        self._update_session_info()
+
     # -- lifecycle ------------------------------------------------------
 
     def closeEvent(self, event) -> None:  # noqa: N802 - Qt override
@@ -1038,6 +1276,16 @@ class MainWindow(QMainWindow):
         # UI thread. Never call a `Session`/`SessionWorker` method directly
         # from the UI thread.
         try:
+            # Abort an in-flight summarization BEFORE teardown: the event is
+            # ours (created in `_on_summarize_clicked`), so `set()` is
+            # direct and thread-safe -- the summarize daemon thread will
+            # stop calling the backend at its next cancel point, and any
+            # late signal it emits is dropped by the worker's `_safe_emit`.
+            if (
+                self._summarizing_dir is not None
+                and self._summarize_cancel_event is not None
+            ):
+                self._summarize_cancel_event.set()
             if self._recording:
                 self.request_stop.emit()
         finally:

@@ -1,22 +1,25 @@
-"""Map-reduce summarization pipeline and the single public entrypoint.
+"""Summarization pipeline — orchestration only.
 
-`run_summarization` is the seam the GUI worker calls after a session finishes:
-it loads a finished session's transcript.json, merges consecutive same-speaker
-segments, summarizes via an OpenAI-compatible LLM (map per chunk, then reduce),
-and writes a structured Russian `summary.docx` into the session directory.
+`run_summarization` is the single public entrypoint the GUI worker calls
+after a session finishes: it validates the options, loads the finished
+session's transcript.json, merges consecutive same-speaker segments, runs the
+selected strategy (`STRATEGIES`) to condense the transcript, makes ONE final
+LLM call (`_finalize`, Markdown for every strategy and every prompt), and
+writes a timestamped `summary_<strategy>_<YYYYMMDD_HHMMSS>.docx` into the
+session directory.
 
 Rules:
-  - Raise a clear exception on any failure (missing/empty transcript, LLM error);
-    the caller surfaces it. Errors are never swallowed.
-  - Never overwrite or delete the existing transcript.* files (we only ever
-    write summary.docx).
-  - No Qt imports. `on_status` may be called from any thread; keep it best-effort.
+  - All failures are funneled into SummarizationError (Russian message);
+    cancellation raises SummarizationCancelled. Never swallowed.
+  - Never overwrite or delete the existing transcript.* files.
+  - No Qt imports. `on_status` may be called from any thread; best-effort.
 """
 
 from __future__ import annotations
 
 import json
-import re
+import threading
+from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 from typing import Callable
@@ -25,16 +28,35 @@ from app.config import Config
 from app.log import get_logger
 from app.pipeline.transcript import Segment, _fmt_clock, merge_consecutive
 from app.summarize import prompts
-from app.summarize.chunking import build_transcript_text, chunk_text
-from app.summarize.client import build_client, chat, chat_structured
-from app.summarize.docx_export import SummaryMeta, write_docx
-from app.summarize.schema import MeetingSummary
+from app.summarize.chunking import build_transcript_text
+from app.summarize.client import build_client, chat
+from app.summarize.docx_export import SummaryMeta, write_markdown_docx
+from app.summarize.errors import SummarizationCancelled, SummarizationError
+from app.summarize.extractive import Embedder
+from app.summarize.parallel import parallel_map
+from app.summarize.strategies import (
+    DEFAULT_STRATEGY_ID,
+    STRATEGIES,
+    StrategyInfo,
+)
+from app.summarize.strategies.base import FinalInput, StrategyContext
 
 logger = get_logger("summarize.pipeline")
 
+# Legacy filename written before per-method timestamped reports existed.
+_LEGACY_SUMMARY_NAME = "summary.docx"
 
-class SummarizationError(Exception):
-    """Raised when summarization cannot complete (bad input or LLM failure)."""
+
+@dataclass(frozen=True)
+class SummarizationOptions:
+    """Per-run user choices (one object in the Qt signal; no Qt here).
+
+    `custom_prompt=None` means "use the built-in DEFAULT_REPORT_PROMPT"; a
+    non-None value must be non-blank (validated before any network call).
+    """
+
+    strategy: str = DEFAULT_STRATEGY_ID
+    custom_prompt: str | None = None
 
 
 def _notify(on_status: Callable[[str], None] | None, message: str) -> None:
@@ -79,7 +101,9 @@ def _load_segments(transcript_path: Path) -> list[Segment]:
     return segments
 
 
-def _build_meta(session_dir: Path, segments: list[Segment]) -> SummaryMeta:
+def _build_meta(
+    session_dir: Path, segments: list[Segment], method: str | None
+) -> SummaryMeta:
     name = session_dir.name
     date_str = name
     try:
@@ -105,26 +129,80 @@ def _build_meta(session_dir: Path, segments: list[Segment]) -> SummaryMeta:
         segment_count=len(segments),
         speakers=speakers,
         duration_str=duration_str,
+        method=method,
     )
+
+
+def _validate_options(
+    options: SummarizationOptions, config: Config
+) -> StrategyInfo:
+    """Validate user options BEFORE any network call (ADR-002 D4/D6)."""
+    info = STRATEGIES.get(options.strategy)
+    if info is None:
+        raise SummarizationError(
+            f"Неизвестный метод саммаризации: {options.strategy!r}."
+        )
+    if options.custom_prompt is not None and not options.custom_prompt.strip():
+        raise SummarizationError(
+            "Пользовательский промпт пуст: заполните «Промпт отчёта…» или "
+            "используйте промпт по умолчанию."
+        )
+    if info.requires_embeddings and not config.embed.is_configured:
+        raise SummarizationError(
+            f"Для метода «{info.label}» нужны настройки эмбеддингов: "
+            "задайте EMBED_URL и EMBED_MODEL в .env."
+        )
+    return info
+
+
+def _finalize(
+    ctx: StrategyContext, final_input: FinalInput, custom_prompt: str | None
+) -> str:
+    """The ONE final LLM call, shared by all strategies; returns Markdown.
+
+    Message layout: strategy framing + material + report-format requirements
+    (built-in DEFAULT_REPORT_PROMPT or the user's prompt). The user's text is
+    always concatenated as a VALUE — never `.format()`-ed, so braces in it
+    are safe. Markdown output rules live in the fixed SYSTEM part, not in the
+    user-editable prompt.
+    """
+    prompt = custom_prompt if custom_prompt is not None else prompts.DEFAULT_REPORT_PROMPT
+    user = (
+        final_input.framing
+        + "\n\n"
+        + final_input.material
+        + "\n\n"
+        + "Требования к формату отчёта:\n"
+        + prompt
+    )
+    system = prompts.SYSTEM + "\n\n" + prompts.MARKDOWN_OUTPUT_RULES
+    return chat(ctx.client, ctx.llm, system, user)
 
 
 def run_summarization(
     session_dir: str | Path,
     config: Config,
     on_status: Callable[[str], None] | None = None,
+    options: SummarizationOptions | None = None,
+    cancel_event: threading.Event | None = None,
 ) -> Path:
-    """Summarize a finished session and write summary.docx into `session_dir`.
+    """Summarize a finished session and write a .docx report into `session_dir`.
 
-    Loads transcript.json, merges consecutive same-speaker segments, runs the
-    map-reduce pipeline over the configured OpenAI-compatible LLM, and writes
-    `summary.docx` into `session_dir`. Returns the path to the written file.
+    Output: `summary_<strategy_id>_<YYYYMMDD_HHMMSS>.docx` (a new file per
+    run). Returns the path to the written file.
 
-    Raises SummarizationError (or the LLM client's own exceptions) on failure;
-    the existing transcript.* files are never touched.
+    Raises SummarizationCancelled when `cancel_event` is set (no report is
+    written) or SummarizationError on any other failure; the existing
+    transcript.* files are never touched.
     """
     session_dir = Path(session_dir)
     if not session_dir.is_dir():
         raise SummarizationError(f"Каталог сессии не найден: {session_dir}")
+
+    options = options or SummarizationOptions()
+    info = _validate_options(options, config)
+    if cancel_event is not None and cancel_event.is_set():
+        raise SummarizationCancelled()
 
     _notify(on_status, "Саммаризация: чтение стенограммы…")
     segments = _load_segments(session_dir / "transcript.json")
@@ -132,65 +210,90 @@ def run_summarization(
     # Cap merged line length at the chunk budget so chunk_text splits long
     # monologues at turn boundaries instead of hard-cutting mid-sentence.
     merged = merge_consecutive(segments, max_chars=llm.chunk_chars)
-
     text = build_transcript_text(merged)
-    chunks = chunk_text(text, llm.chunk_chars, llm.chunk_overlap)
-    if not chunks:
-        raise SummarizationError("После обработки стенограммы не осталось текста.")
 
     client = build_client(llm)
-
-    # Any transport/API failure (openai errors, timeouts) or an empty-response
-    # RuntimeError from chat() is wrapped into a clean Russian SummarizationError
-    # so the GUI surfaces a user-facing message, not a raw technical trace.
+    embedder: Embedder | None = None
     try:
-        if len(chunks) == 1:
-            _notify(on_status, "Саммаризация: обработка стенограммы…")
-            structured = chat_structured(
-                client,
-                llm,
-                prompts.SYSTEM,
-                prompts.SINGLE_INSTRUCTIONS.format(chunk=chunks[0]),
-                MeetingSummary,
-            )
-        else:
-            total = len(chunks)
-            chunk_summaries: list[str] = []
-            for i, chunk in enumerate(chunks, start=1):
-                _notify(
-                    on_status,
-                    f"Саммаризация: обработка фрагмента {i}/{total}…",
-                )
-                result = chat(
-                    client,
-                    llm,
-                    prompts.SYSTEM,
-                    prompts.MAP_INSTRUCTIONS.format(index=i, total=total, chunk=chunk),
-                )
-                chunk_summaries.append(result)
-            _notify(on_status, "Сборка итогового отчёта…")
-            joined = "\n\n---\n\n".join(chunk_summaries)
-            structured = chat_structured(
-                client,
-                llm,
-                prompts.SYSTEM,
-                prompts.REDUCE_INSTRUCTIONS.format(summaries=joined),
-                MeetingSummary,
-            )
+        # The embeddings endpoint is only touched by requires_embeddings
+        # strategies; the guard above guarantees it is configured for them.
+        # Built inside the try so a constructor failure surfaces as
+        # SummarizationError and the LLM client is closed in `finally`.
+        embedder = Embedder(config.embed) if info.requires_embeddings else None
+        ctx = StrategyContext(
+            client=client,
+            llm=llm,
+            embedder=embedder,
+            notify=lambda msg: _notify(on_status, msg),
+            cancel_event=cancel_event,
+        )
+        final_input = info.condense(text, ctx)
+        _notify(on_status, "Сборка итогового отчёта…")
+        # The final call goes through parallel_map too, so cancellation stays
+        # prompt even if the user cancels while it is in flight: we never
+        # block on the in-flight HTTP call, its result is discarded.
+        markdown = parallel_map(
+            [None],
+            lambda _item: _finalize(ctx, final_input, options.custom_prompt),
+            max_workers=1,
+            cancel_event=cancel_event,
+        )[0]
     except SummarizationError:
         raise
     except Exception as exc:  # noqa: BLE001 - unify LLM/transport errors
         raise SummarizationError(f"Ошибка обращения к LLM: {exc}") from exc
+    finally:
+        # NOTE: close() does NOT abort in-flight requests — the openai SDK
+        # keeps them running to completion (up to request_timeout per attempt,
+        # with retries) in the abandoned daemon threads, and their results are
+        # discarded. We close anyway to release the connection pool.
+        try:
+            client.close()
+        except Exception:  # pragma: no cover - best-effort teardown
+            logger.warning("Не удалось закрыть LLM-клиент", exc_info=True)
+        if embedder is not None:
+            try:
+                embedder.close()
+            except Exception:  # pragma: no cover - best-effort teardown
+                logger.warning(
+                    "Не удалось закрыть клиент эмбеддингов", exc_info=True
+                )
 
-    _notify(on_status, "Саммаризация: запись summary.docx…")
-    meta = _build_meta(session_dir, merged)
-    # A locked/open summary.docx (common on Windows when it's open in Word) or
-    # any other write failure becomes a clear Russian error, not a raw OSError.
+    if cancel_event is not None and cancel_event.is_set():
+        # Cancelled while the final call was in flight: discard, write nothing.
+        raise SummarizationCancelled()
+
+    _notify(on_status, "Саммаризация: запись отчёта…")
+    meta = _build_meta(session_dir, merged, info.label)
+    out_path = session_dir / (
+        f"summary_{info.id}_{datetime.now():%Y%m%d_%H%M%S}.docx"
+    )
+    # A locked/open file (common on Windows when it's open in Word) or any
+    # other write failure becomes a clear Russian error, not a raw exception.
     try:
-        out_path = write_docx(structured, meta, session_dir / "summary.docx")
+        write_markdown_docx(markdown, meta, out_path)
     except OSError as exc:
         raise SummarizationError(
-            f"Не удалось сохранить summary.docx (возможно, файл открыт в Word): {exc}"
+            f"Не удалось сохранить {out_path.name} "
+            f"(возможно, файл открыт в Word): {exc}"
         ) from exc
+    except Exception as exc:  # noqa: BLE001 - keep the SummarizationError contract
+        raise SummarizationError(f"Не удалось сохранить {out_path.name}: {exc}") from exc
     _notify(on_status, "Саммаризация завершена.")
     return out_path
+
+
+def find_latest_summary(session_dir: str | Path) -> Path | None:
+    """Newest report in `session_dir` by mtime, or None if there is none.
+
+    Considers both per-method files (`summary_*.docx`) and the legacy
+    `summary.docx` written by older versions.
+    """
+    session_dir = Path(session_dir)
+    candidates = [p for p in session_dir.glob("summary_*.docx") if p.is_file()]
+    legacy = session_dir / _LEGACY_SUMMARY_NAME
+    if legacy.is_file():
+        candidates.append(legacy)
+    if not candidates:
+        return None
+    return max(candidates, key=lambda p: p.stat().st_mtime)

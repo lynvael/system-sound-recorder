@@ -266,28 +266,33 @@ tests. See "Верификация" in `kind-hatching-allen.md`.
   semantics unchanged (gates buttons/timer/delete-guard/teardown).
 
 ## Summarization (`app/summarize/`)
-- **On-demand, decoupled from Session lifecycle.** `run_summarization()` (the sole
-  public entrypoint, `app/summarize/pipeline.py`) is NOT wired into recording
-  start/stop — it just reads a finished session's `transcript.json` from disk and
-  writes `summary.docx` next to it. Works for any past session under `recordings/`,
-  not just the one just recorded. Called from the GUI's right-hand "Сеанс" panel
-  («Саммаризация» button), off the UI thread.
-- **Final protocol uses the LLM's NATIVE structured output**, not Markdown
-  scraping. `schema.py` defines pydantic `MeetingSummary`{tldr, key_decisions[],
-  tasks[{text, assignee?}], topics[], open_questions[]} + `Task`.
-  `client.chat_structured()` sends `response_format={"type":"json_schema",
-  "json_schema":{...,"strict":True}}` and validates the reply into the model; the
-  free-text MAP pass still uses plain `chat()`. `docx_export.write_docx` renders
-  from the OBJECT (no more `_parse_sections`). Russian section HEADINGS now live in
-  docx_export as the single source of truth.
-- **`strict_json_schema` (schema.py) MUST strip `default` from every node** —
-  genuine OpenAI strict mode 400s on `'default'` (its own SDK strips None defaults).
-  pydantic emits `"default": null` for `assignee: str|None = None`, so `_strictify`
-  pops `default` and sets `additionalProperties:false` + `required=all props` on
-  every object node INCLUDING nested `Task` under `$defs`. Nullable `assignee` stays
-  `anyOf:[string,null]` and stays REQUIRED (OpenAI's nullable pattern). Lenient
-  local servers (llama.cpp/some vLLM) ignore a stray `default`, so this bug only
-  shows against real OpenAI — test there, not just locally.
+- **On-demand, decoupled from Session lifecycle.** `run_summarization()`
+  (`app/summarize/pipeline.py`) is NOT wired into recording start/stop — it reads a
+  finished session's `transcript.json` and writes a NEW
+  `summary_<strategy>_<YYYYMMDD_HHMMSS>.docx` per run (never overwrites; GUI opens the
+  newest via `find_latest_summary`, legacy `summary.docx` counted). Called from the
+  GUI "Сеанс" panel off the UI thread.
+- **Strategies (ADR-002, 2026-09-30).** User picks map_reduce (default, the app's
+  original algorithm) / eacss / hierarchical (ported from summary_tests/, which stay
+  as standalone experiments). A strategy = `condense(text, ctx) -> FinalInput`; the
+  FINAL LLM call is done once for all strategies in pipeline `_finalize`.
+- **Structured output was REMOVED on purpose (user decision 2026-09-30)** — one format
+  for default and user prompts: Markdown via `chat()` → built-in subset
+  Markdown→docx renderer. Don't reintroduce json_schema/MeetingSummary. The user's
+  report prompt (one for all strategies, only affects the final step) is
+  CONCATENATED after the material, never `.format()`-ed. The GUI checkbox
+  «Использовать промпт по умолчанию» must never erase the stored custom text.
+- **Parallelism & cancellation.** `parallel_map` (app/summarize/parallel.py) uses its
+  own DAEMON threads, NOT ThreadPoolExecutor: executor workers are non-daemon and
+  get joined at interpreter exit (closing the app kept calling the LLM for minutes).
+  On error/cancel the pending queue is drained before stop sentinels. Cancel =
+  GUI-owned `threading.Event` passed through `request_summarize(dir, options, event)`
+  (creating it in the worker slot lost cancels while the worker QThread was busy).
+  `client.close()` does NOT abort in-flight openai requests (verified) — they finish
+  in abandoned threads, results discarded. `LLM_CONCURRENCY` default 3; real cap is
+  on the user's LiteLLM proxy. `LLM_REQUEST_TIMEOUT` is PER ATTEMPT (SDK retries 2×).
+- **EACSS/hierarchical need `EMBED_*`** (remote OpenAI-compatible embeddings); greyed
+  out in the combo when not configured, validated before any network call.
 - **Map-reduce over an OpenAI-compatible endpoint**, configured entirely via
   `LLM_*` env vars (`config.llm`: `url`, `api_key`, `model`, `chunk_chars`,
   `chunk_overlap`, `temperature`, `max_tokens`, `request_timeout`). Consecutive
@@ -312,7 +317,8 @@ tests. See "Верификация" in `kind-hatching-allen.md`.
   quality improvement. The `"[mm:ss] Speaker: "` render prefix is NOT counted
   in the limit (safe: guard covers it). Tests: `tests/test_summarize_chunking.py`.
 - **All failures wrapped in `SummarizationError`** (Russian-language message,
-  defined in `app/summarize/pipeline.py`) — missing/empty/malformed transcript,
+  defined in `app/summarize/errors.py`; `SummarizationCancelled` is a subclass —
+  catch it first) — missing/empty/malformed transcript,
   LLM/transport errors, and docx save failures (e.g. file open in Word on
   Windows) all funnel through it. It is always non-terminal in the GUI: a failed
   summarization never touches or deletes the existing `transcript.*` files, so

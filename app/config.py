@@ -88,8 +88,38 @@ class LLMSettings(_Base):
     temperature: float = 0.3
     # Upper bound on the model's response length per LLM call.
     max_tokens: int = 16384
-    # Per-request timeout in seconds (whole call, incl. retries by the client).
-    request_timeout: float = 120.0
+    # Per-request timeout in seconds. The openai SDK applies it to EACH
+    # attempt, not the whole call: with the SDK's default max_retries=2 a
+    # single chat() can take up to 3 x this value. 300 s: the proxy with
+    # reasoning enabled can take well over a minute on large prompts.
+    request_timeout: float = 300.0
+    # Max parallel LLM calls in the map phase (fan-out is bounded by this;
+    # the real ceiling is enforced by the LiteLLM proxy).
+    concurrency: int = 3
+
+
+class EmbedSettings(_Base):
+    """Remote OpenAI-compatible embeddings endpoint (EMBED_ prefix).
+
+    Needed only by the extractive strategies (EACSS, hierarchical — part 2 of
+    ADR-002). Variable names match the summary_tests/ experiments, so one
+    .env works for both.
+    """
+
+    model_config = SettingsConfigDict(
+        env_prefix="EMBED_", env_file=".env", extra="ignore"
+    )
+
+    # `url` becomes the openai client `base_url` (include /v1 if required).
+    url: str = ""
+    api_key: str = "not-needed"
+    model: str = ""
+    request_timeout: float = 60.0
+
+    @property
+    def is_configured(self) -> bool:
+        """True when both url and model are set (endpoint usable)."""
+        return bool(self.url.strip() and self.model.strip())
 
 
 class SessionSettings(_Base):
@@ -116,6 +146,7 @@ class Config:
         self.vad = VADSettings()
         self.session = SessionSettings()
         self.llm = LLMSettings()
+        self.embed = EmbedSettings()
 
 
 def load_config() -> Config:
