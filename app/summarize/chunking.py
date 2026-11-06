@@ -22,7 +22,11 @@ def chunk_text(text: str, chunk_chars: int, overlap: int) -> list[str]:
 
     Prefers to cut on the last newline inside the budget so speaker turns stay
     intact; falls back to a hard character cut when a single line exceeds the
-    budget.
+    budget. A newline is only accepted as a cut point when it still advances
+    the window by more than `overlap` chars — otherwise the hard cut applies.
+    Without that guard a line longer than the budget would make the window
+    crawl forward one character at a time, emitting O(overlap) nearly
+    identical degenerate chunks.
     """
     text = text.strip()
     if not text:
@@ -39,7 +43,9 @@ def chunk_text(text: str, chunk_chars: int, overlap: int) -> list[str]:
         if end < n:
             # Try to break on a newline within the window (after some content).
             nl = text.rfind("\n", start, end)
-            if nl > start:
+            # Only cut at the newline if it guarantees forward progress beyond
+            # the overlap; otherwise fall through to the hard character cut.
+            if nl > start and nl - overlap > start:
                 end = nl
         chunks.append(text[start:end].strip())
         if end >= n:

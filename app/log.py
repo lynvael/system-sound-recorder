@@ -11,7 +11,7 @@ PREFIX = "recorder"
 FORMAT = "%(asctime)s [%(levelname)s] %(name)s: %(message)s"
 
 # Libraries that raise their own level and would otherwise slip through.
-NOISY = ("transformers", "torch", "torchaudio", "numba", "soundcard", "urllib3")
+NOISY = ("transformers", "torch", "torchaudio", "numba", "pyaudiowpatch", "urllib3")
 
 
 class _TrimPrefix(logging.Formatter):

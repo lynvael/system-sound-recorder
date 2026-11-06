@@ -8,7 +8,9 @@ Run with ``python -m app.cli`` (the GUI entrypoint stays ``python -m app`` /
 ``app/__main__.py``; this module never imports PySide6).
 
 Subcommands:
-  - ``list-devices``          enumerate microphones and loopbacks (name + id).
+  - ``list-devices``          enumerate microphones and loopbacks (name — the
+                              device "id" is the name itself; PortAudio
+                              exports no stable endpoint id).
   - ``transcribe FILE``       headless file transcription of an arbitrary
                               audio/WAV file (a 2-channel file is treated as our
                               stereo ``session.wav`` for full attribution; mono
@@ -97,15 +99,29 @@ class _SessionRunner:
 # --- list-devices ----------------------------------------------------------
 def _cmd_list_devices(args: argparse.Namespace) -> int:
     # Imported lazily so `list-devices` failures don't block `--help` and so the
-    # soundcard backend is only touched when actually enumerating.
+    # PyAudioWPatch backend is only touched when actually enumerating.
     from app.audio import devices
 
+    try:
+        mics = devices.list_microphones()
+        loopbacks = devices.list_loopbacks()
+        try:
+            default_mic, default_loopback = devices.default_device_names()
+        except Exception:  # noqa: BLE001 - default markers are best-effort:
+            # the lists above already succeeded, so a failure here just means
+            # "no markers", never an error.
+            default_mic = default_loopback = None
+    except Exception as exc:  # noqa: BLE001 - e.g. non-Windows: no backend
+        _eprint(f"[ошибка] Не удалось получить список устройств: {exc}")
+        return 1
     print("=== Микрофоны ===")
-    for name, dev_id in devices.list_microphones():
-        print(f"  {name}\n    id: {dev_id}")
+    for name, dev_id in mics:
+        marker = "  ← по умолчанию" if name == default_mic else ""
+        print(f"  {name}{marker}\n    id: {dev_id}")
     print("\n=== Системный звук (loopback) ===")
-    for name, dev_id in devices.list_loopbacks():
-        print(f"  {name}\n    id: {dev_id}")
+    for name, dev_id in loopbacks:
+        marker = "  ← по умолчанию" if name == default_loopback else ""
+        print(f"  {name}{marker}\n    id: {dev_id}")
     return 0
 
 
@@ -247,8 +263,8 @@ def build_parser() -> argparse.ArgumentParser:
     p_rec.add_argument(
         "--mic-id",
         default=None,
-        help="Microphone device id (from `list-devices`). Required unless "
-        "--no-mic is given.",
+        help="Microphone device NAME (from `list-devices`; the device id is "
+        "the name). Required unless --no-mic is given.",
     )
     p_rec.add_argument(
         "--no-mic",
@@ -258,7 +274,8 @@ def build_parser() -> argparse.ArgumentParser:
     p_rec.add_argument(
         "--loopback-id",
         required=True,
-        help="Loopback device id (from `list-devices`).",
+        help="Loopback device NAME (from `list-devices`; the device id is "
+        "the name).",
     )
     p_rec.add_argument(
         "--mode",

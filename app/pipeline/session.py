@@ -61,7 +61,7 @@ from pathlib import Path
 from typing import Optional
 
 from app.audio import wav_source
-from app.audio.capture import DEFAULT_NATIVE_RATE, CaptureThread
+from app.audio.capture import CaptureThread
 from app.audio.recorder import AlignedRecorder
 from app.config import Config
 from app.log import get_logger
@@ -75,7 +75,7 @@ logger = get_logger("session")
 _DISK_BLOCKSIZE = 4096
 
 # Bounded wait for capture/feeder/segmenter threads to exit on stop(). A wedged
-# soundcard.record() (e.g. loopback blocking on system silence) can otherwise
+# stream.read() (e.g. loopback blocking on system silence) can otherwise
 # hang teardown indefinitely; we log and abandon the thread instead.
 _JOIN_TIMEOUT = 5.0
 
@@ -228,6 +228,15 @@ class Session:
         safe_name = _sanitize_session_name(name)
         dir_name = f"{timestamp}_{safe_name}" if safe_name else timestamp
         self.session_dir = Path(config.session.output_dir) / dir_name
+        # Dedicated directory for the STT engine's temp WAVs (GigaAM writes one
+        # per segment). It must stay OUTSIDE session_dir: session names may be
+        # Cyrillic (sanitization deliberately preserves them), and GigaAM's
+        # remote code cannot open non-ASCII paths on Windows ([WinError 2]).
+        # The name is ASCII-only; the engine re-validates the resolved path
+        # (absolute, ASCII) and falls back to the system tempdir when it is
+        # unusable. The GUI session picker skips dot-prefixed dirs, so this
+        # helper dir never shows up as a session.
+        self._stt_tmp_dir = Path(config.session.output_dir) / ".stt_tmp"
         self.wav_path = self.session_dir / "session.wav"
         # Per-channel mono outputs (live/batch). Derived in lockstep from the
         # same aligned blocks as session.wav, so they stay sample-for-sample
@@ -479,8 +488,9 @@ class Session:
         names = ["capture-mic", "capture-loop"]
         # The mic channel must NEVER open a loopback endpoint (that would capture
         # system audio and duplicate the loopback channel); the loopback channel
-        # is genuinely a WASAPI loopback. This flag both selects include_loopback
-        # for id resolution AND is validated against the resolved device.
+        # is genuinely a WASAPI loopback. This flag both selects the expected
+        # isLoopbackDevice for name resolution AND is validated against the
+        # resolved device (see app/audio/devices.get_device).
         expect_loopbacks = [False, True]
         # record_mic=False: the mic capture+feeder are simply not started. The
         # left channel stays empty, AlignedRecorder silence-pads it, and the mic
@@ -491,13 +501,15 @@ class Session:
         ):
             if not is_enabled:
                 continue
+            # The native rate is NOT passed here: CaptureThread reads it from
+            # the resolved device (per-device defaultSampleRate, with a
+            # fallback) inside run(), after resolution.
             ct = CaptureThread(
                 dev_id,
                 cap_q,
                 frame_size=self.frame_size,
                 target_sample_rate=self.rate,
                 expect_loopback=expect_loopback,
-                native_sample_rate=DEFAULT_NATIVE_RATE,
                 chunk_frames=self.config.capture.chunk_frames,
                 name=name,
             )
@@ -527,7 +539,7 @@ class Session:
     def _join_captures_and_feeders(self) -> None:
         """Join capture + feeder threads with a bounded timeout.
 
-        A wedged soundcard.record() never returns, so its capture thread also
+        A wedged stream.read() never returns, so its capture thread also
         never emits the sentinel that unblocks its feeder. We wait a bounded
         time, then log and abandon rather than hang stop()/app close.
         """
@@ -656,7 +668,7 @@ class Session:
         self._validate_capture_devices()
         self._set_status("Загрузка модели…")
         try:
-            self._engine = build_engine(self.config)
+            self._engine = build_engine(self.config, work_dir=self._stt_tmp_dir)
         except Exception as exc:
             # Surface, then propagate so start() raises and the GUI worker resets
             # instead of being left with a half-initialized session.
@@ -796,7 +808,7 @@ class Session:
         if self._engine is None:
             self._set_status("Загрузка модели…")
             try:
-                self._engine = build_engine(self.config)
+                self._engine = build_engine(self.config, work_dir=self._stt_tmp_dir)
             except Exception as exc:
                 self._emit_error(f"Не удалось загрузить модель STT: {exc}")
                 self._finish()

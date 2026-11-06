@@ -1,3 +1,4 @@
+- (2026-09-21) PortAudio v19 (в составе PyAudioWPatch) имеет ДРУГУЮ нумерацию констант, чем старый PyAudio/v18: форматы — битовые флаги (paFloat32=1, не 3), коды ошибок сдвинуты (paNotInitialized=-10000, paDeviceUnavailable=-9985, paInputOverflowed=-9981), paBufferOverflow/paDevicesNotAvailable/paInvalidSampleFormat в v19 не существуют. Ссылаться только на именованные константы модуля pyaudiowpatch, никогда на литералы; stub в tests/conftest.py содержит реальные v19-значения.
 # Project Memory — Live Recorder
 
 Facts that help future work and are NOT obvious from the code alone.
@@ -74,19 +75,21 @@ segmenter, `app/common/{config,log}.py`).
   zero-speech recording (VAD found nothing) never false-positives.
 
 ## Gotchas / traps
-- **Don't import `soundcard` (directly or transitively) at module scope in GUI code
-  that loads before `QApplication` exists** — it breaks launch with
-  `QWindowsContext: OleInitialize() failed: COM error 0x80010106 (RPC_E_CHANGED_MODE)`.
-  `soundcard`'s import runs `CoInitializeEx(MTA)` on the main thread; if that happens
-  before Qt creates `QApplication` (which does `OleInitialize` → STA), Qt loses the
-  apartment race. Only `app/audio/devices.py` and `app/audio/capture.py` import
-  soundcard, but BOTH are reachable from `app/gui/main_window.py` at import time:
-  directly (`devices`) and transitively via `app.gui.worker → app.pipeline.session →
-  app.audio.capture`. Fix: those imports in main_window are LAZY (inside
-  `_populate_devices` / `__init__` / `_on_start_clicked`), so they run only after
-  `main()` has constructed `QApplication`. soundcard itself tolerates STA (it catches
-  `RPC_E_CHANGED_MODE` and falls back), so no backend/threading change is needed — just
-  keep those imports off module scope. See the NOTE block near the top of main_window.py.
+- **The audio backend (PyAudioWPatch, ADR-001) must not be initialized before
+  `QApplication` exists.** The old `soundcard` backend ran `CoInitializeEx(MTA)` at
+  import time and lost the COM apartment race against Qt's STA (`OleInitialize()
+  failed: RPC_E_CHANGED_MODE`). The replacement: importing `pyaudiowpatch` is
+  harmless, but CREATING the `PyAudio()` instance runs PortAudio's `CoInitialize`
+  (STA, Qt-compatible) — so the instance is a LAZY module singleton in
+  `app.audio.backend` (`get_backend()`, double-checked locking, `shutdown()` via
+  atexit), created on first real use (device enumeration / capture start), and
+  `app.audio.devices` / `app.audio.capture` are imported lazily in the GUI
+  (main_window's `_populate_devices` / `__init__` / `_on_start_clicked`) so no audio
+  code runs before `main()` constructs `QApplication`. `pyaudiowpatch` ships
+  Windows-only wheels → `sys_platform == 'win32'` dep marker in pyproject.toml: on
+  the Linux dev box the audio modules still import (lazy import), capture /
+  list-devices raise a Russian RuntimeError, and tests use the conftest stub.
+  See the NOTE block near the top of main_window.py and docs/adr/0001.
 - **Native Windows `QFileDialog` freezes the GUI on file-open.** `getOpenFileName`'s
   native Win32 dialog synchronously enumerates shell namespace extensions
   (OneDrive/cloud overlays, network/mapped drives in Quick access/Recent) on the UI
@@ -102,20 +105,21 @@ segmenter, `app/common/{config,log}.py`).
   `_is_stopped`. (AlignedRecorder's `self._stop` Event is fine — it is NOT a Thread
   subclass, it runs a separate `threading.Thread(target=self._run)`.) This class of bug
   is invisible to compile/import checks — only shows at runtime when join() is called.
-- **`soundcard.get_microphone(id, include_loopback=True)` does FUZZY id matching** and
-  will silently fall back to a LOOPBACK endpoint when a mic id no longer resolves exactly
-  (e.g. mic physically unplugged). `_match_device` tries exact-id → name-substring → regex
-  fuzzy; `all_microphones(include_loopback=True)` lists loopbacks first, so a disconnected
-  mic resolved to a system-audio endpoint. Result: the mic ("Я") channel captured the SAME
-  system audio as the loopback ("Собеседники") channel → EVERY utterance transcribed twice
-  (duplicated live replicas). Fix (in `app/audio/capture.py`): `CaptureThread` takes a
-  required `expect_loopback` bool; `_resolve_device` passes it as `include_loopback` (mic=
-  False so a loopback can't even be a candidate) AND validates the resolved device — exact
-  `device.id == requested id` (rejects any fuzzy fallback) and `device.isloopback ==
-  expect_loopback` — raising a Russian error. `_start_captures` passes
-  `expect_loopback=[False, True]` for `[mic, loopback]`. Do NOT "solve" this class of
-  duplication with content/correlation dedup (deliberately removed — see file-mode note
-  above); fix device resolution at the source.
+- **The mic channel must NEVER resolve to a loopback endpoint** (invariant #1).
+  Root cause of the original duplicated-transcription bug: the old `soundcard`
+  backend's FUZZY id matching (`_match_device`: exact-id → name-substring → regex
+  fuzzy) silently fell back to a LOOPBACK endpoint when a mic id stopped resolving
+  (e.g. mic unplugged) — the mic ("Я") channel then captured the SAME system audio
+  as the loopback ("Собеседники") channel and EVERY utterance was transcribed
+  twice. Current protection (ADR-001, PyAudioWPatch): device identity is the NAME
+  (PortAudio keeps the WASAPI endpoint id in its C struct but does not export it to
+  Python); `app/audio/devices.get_device` matches on EXACT name +
+  `isLoopbackDevice == expect_loopback` with NO fuzzy/substring fallbacks —
+  0 matches → Russian «не найдено», >1 → «неоднозначно» (fail-fast). `CaptureThread`
+  takes a required `expect_loopback` bool; `_start_captures` passes
+  `expect_loopback=[False, True]` for `[mic, loopback]`. Do NOT "solve" this class
+  of duplication with content/correlation dedup (deliberately removed — see
+  file-mode note above); fix device resolution at the source.
 - **Capture-device failure is PARTIAL-tolerant** (see `Session._handle_capture_errors`,
   `_abort_if_all_captures_failed_at_start`). A capture thread that can't resolve its device
   sets `.error` and exits WITHOUT setting `.resolved`, but still emits
@@ -178,9 +182,12 @@ segmenter, `app/common/{config,log}.py`).
   scaled loopback copy) to detect the user's own voice.
 - **`silero-vad==6.2.2` imports `onnxruntime` at package import but doesn't declare it** —
   `onnxruntime` is in base deps for this reason. Don't remove it.
-- **Native capture rate is assumed 48000 Hz** (`soundcard` needs an explicit samplerate
-  and has no reliable native-rate API); soxr resamples to 16 kHz. Revisit if a device's
-  native rate differs — would need plumbing through config.
+- **Native capture rate is per-device** (ADR-001): `CaptureThread.run()` reads the
+  resolved device's `defaultSampleRate` (WASAPI mix-format rate) and opens the stream
+  at that rate in `paFloat32`; `DEFAULT_NATIVE_RATE = 48000` (app/audio/capture.py)
+  is only a fallback when the value is missing/<= 0. soxr then resamples to the
+  target rate. (The old backend had no native-rate API, hence the old hardcoded
+  48000 passed from session.py.)
 - **Dep pins are chosen for GigaAM-v3 compat:** `torch==2.8.0`, `torchaudio==2.8.0`,
   `transformers==4.57.1`. GigaAM extras (`[gigaam]`): pyannote-audio, hydra-core,
   omegaconf, sentencepiece, torchcodec. GigaAM is Russian-only and transcribes via a
@@ -198,6 +205,27 @@ segmenter, `app/common/{config,log}.py`).
   Silero loads LAZILY on first long segment. If sub-VAD yields ZERO chunks for known-speech
   audio, `_fixed_windows` hard-splits into ≤20s windows so a long segment is never dropped.
   Sub-chunk transcribe errors propagate (non-terminal).
+- **GigaAM REQUIRES `ffmpeg` on PATH (hard runtime dependency) — the CONFIRMED root
+  cause of the field `[WinError 2] Не удается найти указанный файл` (2026-09-21).**
+  GigaAM's remote code (`load_audio` in `modeling_gigaam.py`) decodes the temp WAV by
+  shelling out to an `ffmpeg` subprocess; when ffmpeg is absent, `subprocess.run`
+  raises `FileNotFoundError: [WinError 2]` about the EXECUTABLE, not the WAV — and the
+  old `(temp WAV: ...)` error suffix pointed the diagnosis at the wrong file. The
+  earlier non-ASCII-path hypothesis (Cyrillic %TEMP%) was a RED HERRING: subprocess
+  with list arguments goes through CreateProcessW on Windows, so a Cyrillic path is
+  probably not a problem at all. Protection: `GigaAMEngine.__init__` fails fast on
+  `shutil.which("ffmpeg") is None` with `GigaAMDependencyError` (Russian hint:
+  `winget install Gyan.FFmpeg`) BEFORE the multi-second model load; a
+  `FileNotFoundError` from `model.transcribe()` is remapped to the same ffmpeg error
+  WITHOUT the "(temp WAV: ...)" suffix (assumption documented in code). The ASCII
+  `.stt_tmp` policy is kept only as DEFENSIVE: temp WAVs live in
+  `<output_dir>/.stt_tmp/` (NOT %TEMP%/session_dir; session names keep Cyrillic),
+  `_resolve_tmp_dir()` resolves ABSOLUTE + `.isascii()` + mkdir, any disqualification
+  degrades to the system tempdir with WARNING/ERROR — never raises. Other transcribe
+  errors keep `RuntimeError(f"{exc} (temp WAV: {tmp_path})")` (full path for field
+  diagnosis). GUI session picker skips dot-prefixed dirs. Unit-tested without the
+  model (fake `AutoModel.from_pretrained`, autouse `shutil.which` fixture) in
+  `tests/test_gigaam_tmp_dir.py`.
 - `transformers==4.57.1` pipeline uses the kwarg `dtype` (NOT `torch_dtype`).
 - Drift-trim bound in recorder is `_DRIFT_TRIM_SECONDS = 1.0` — tune after a 30–60 min
   sync test if drift becomes audible.
@@ -238,28 +266,33 @@ tests. See "Верификация" in `kind-hatching-allen.md`.
   semantics unchanged (gates buttons/timer/delete-guard/teardown).
 
 ## Summarization (`app/summarize/`)
-- **On-demand, decoupled from Session lifecycle.** `run_summarization()` (the sole
-  public entrypoint, `app/summarize/pipeline.py`) is NOT wired into recording
-  start/stop — it just reads a finished session's `transcript.json` from disk and
-  writes `summary.docx` next to it. Works for any past session under `recordings/`,
-  not just the one just recorded. Called from the GUI's right-hand "Сеанс" panel
-  («Саммаризация» button), off the UI thread.
-- **Final protocol uses the LLM's NATIVE structured output**, not Markdown
-  scraping. `schema.py` defines pydantic `MeetingSummary`{tldr, key_decisions[],
-  tasks[{text, assignee?}], topics[], open_questions[]} + `Task`.
-  `client.chat_structured()` sends `response_format={"type":"json_schema",
-  "json_schema":{...,"strict":True}}` and validates the reply into the model; the
-  free-text MAP pass still uses plain `chat()`. `docx_export.write_docx` renders
-  from the OBJECT (no more `_parse_sections`). Russian section HEADINGS now live in
-  docx_export as the single source of truth.
-- **`strict_json_schema` (schema.py) MUST strip `default` from every node** —
-  genuine OpenAI strict mode 400s on `'default'` (its own SDK strips None defaults).
-  pydantic emits `"default": null` for `assignee: str|None = None`, so `_strictify`
-  pops `default` and sets `additionalProperties:false` + `required=all props` on
-  every object node INCLUDING nested `Task` under `$defs`. Nullable `assignee` stays
-  `anyOf:[string,null]` and stays REQUIRED (OpenAI's nullable pattern). Lenient
-  local servers (llama.cpp/some vLLM) ignore a stray `default`, so this bug only
-  shows against real OpenAI — test there, not just locally.
+- **On-demand, decoupled from Session lifecycle.** `run_summarization()`
+  (`app/summarize/pipeline.py`) is NOT wired into recording start/stop — it reads a
+  finished session's `transcript.json` and writes a NEW
+  `summary_<strategy>_<YYYYMMDD_HHMMSS>.docx` per run (never overwrites; GUI opens the
+  newest via `find_latest_summary`, legacy `summary.docx` counted). Called from the
+  GUI "Сеанс" panel off the UI thread.
+- **Strategies (ADR-002, 2026-09-30).** User picks map_reduce (default, the app's
+  original algorithm) / eacss / hierarchical (ported from summary_tests/, which stay
+  as standalone experiments). A strategy = `condense(text, ctx) -> FinalInput`; the
+  FINAL LLM call is done once for all strategies in pipeline `_finalize`.
+- **Structured output was REMOVED on purpose (user decision 2026-09-30)** — one format
+  for default and user prompts: Markdown via `chat()` → built-in subset
+  Markdown→docx renderer. Don't reintroduce json_schema/MeetingSummary. The user's
+  report prompt (one for all strategies, only affects the final step) is
+  CONCATENATED after the material, never `.format()`-ed. The GUI checkbox
+  «Использовать промпт по умолчанию» must never erase the stored custom text.
+- **Parallelism & cancellation.** `parallel_map` (app/summarize/parallel.py) uses its
+  own DAEMON threads, NOT ThreadPoolExecutor: executor workers are non-daemon and
+  get joined at interpreter exit (closing the app kept calling the LLM for minutes).
+  On error/cancel the pending queue is drained before stop sentinels. Cancel =
+  GUI-owned `threading.Event` passed through `request_summarize(dir, options, event)`
+  (creating it in the worker slot lost cancels while the worker QThread was busy).
+  `client.close()` does NOT abort in-flight openai requests (verified) — they finish
+  in abandoned threads, results discarded. `LLM_CONCURRENCY` default 3; real cap is
+  on the user's LiteLLM proxy. `LLM_REQUEST_TIMEOUT` is PER ATTEMPT (SDK retries 2×).
+- **EACSS/hierarchical need `EMBED_*`** (remote OpenAI-compatible embeddings); greyed
+  out in the combo when not configured, validated before any network call.
 - **Map-reduce over an OpenAI-compatible endpoint**, configured entirely via
   `LLM_*` env vars (`config.llm`: `url`, `api_key`, `model`, `chunk_chars`,
   `chunk_overlap`, `temperature`, `max_tokens`, `request_timeout`). Consecutive
@@ -270,12 +303,38 @@ tests. See "Верификация" in `kind-hatching-allen.md`.
 - **New base deps**: `openai` (LLM client) and `python-docx` (`.docx` export) —
   both in `pyproject.toml` base `dependencies`, so plain `uv sync` installs them
   (no extra needed).
+- **Chunking degeneration fix (2026-09-25).** Old `chunk_text` assumed no line
+  exceeds `chunk_chars`; a merged same-speaker monologue (9897/24127 chars in
+  real sessions) made `rfind("\n")` keep finding the PREVIOUS line's newline,
+  `end` stuck, `start` crawled +1/iter → ~`overlap` (400) nearly-identical
+  garbage chunks (vtb_broken: 407 instead of 7; 24k session: 817). Fix =
+  (a) guard in `chunk_text`: newline accepted only if `nl - overlap > start`,
+  else the (previously unreachable) hard cut; (b) `merge_consecutive(segments,
+  max_chars=None)` — pipeline passes `llm.chunk_chars` so long monologues split
+  at turn boundaries. IMPORTANT: the merge limit ALONE does not fix the
+  degeneration (two consecutive ~8000-char lines still trigger the crawl —
+  verified by simulation); the guard is the actual fix, the limit is a cut
+  quality improvement. The `"[mm:ss] Speaker: "` render prefix is NOT counted
+  in the limit (safe: guard covers it). Tests: `tests/test_summarize_chunking.py`.
 - **All failures wrapped in `SummarizationError`** (Russian-language message,
-  defined in `app/summarize/pipeline.py`) — missing/empty/malformed transcript,
+  defined in `app/summarize/errors.py`; `SummarizationCancelled` is a subclass —
+  catch it first) — missing/empty/malformed transcript,
   LLM/transport errors, and docx save failures (e.g. file open in Word on
   Windows) all funnel through it. It is always non-terminal in the GUI: a failed
   summarization never touches or deletes the existing `transcript.*` files, so
   retrying is always safe.
+
+- **QSettings quirks (GUI device prefs, `app/gui/prefs.py`, 2026-09-21).**
+  (1) On Linux `QSettings(IniFormat, UserScope)` resolves to
+  `$XDG_CONFIG_HOME/<org>/<app>.ini` (NOT the CWD), and Qt CACHES that
+  location after the first QSettings construction in the process — changing
+  `XDG_CONFIG_HOME` between tests is ignored (per-test tmp dirs leak across
+  tests). Tests therefore monkeypatch `prefs.QSettings` to the FILE-NAME
+  constructor `QSettings(path, IniFormat)` — per-instance, deterministic on
+  every platform. (2) PySide6's `QSettings.sync()` returns `None` (not a
+  bool) on success — check `is False`, never `not sync()`. (3) The INI
+  writer renders key `devices/mic` as section `[devices]` + key `mic`
+  (assert on that when checking file contents).
 
 ## Fixed footguns
 - **`pyproject.toml`'s `readme =` pointed at a nonexistent `kind-hatching-allen.md`**,
@@ -288,3 +347,24 @@ Windows, Python >=3.12, package manager **uv**. `uv sync` (base) / `uv sync --ex
 CPU torch via default PyPI index; commented `pytorch-cu128` index in pyproject.toml is the
 GPU opt-in. Run: `python -m app` (GUI), `python -m app.cli {list-devices,transcribe,record}`
 (CLI), or `scripts/run-{gui,cli}.{ps1,bat}`.
+
+## Decisions
+- (2026-09-21) (2026-09-21) Предвыбор устройств в GUI: приоритет = сохранённый выбор (QSettings "LiveRecorder"/"LiveRecorder", ключи devices/mic, devices/loopback) → системный дефолт (devices.default_device_names()) → первый пункт; запись в prefs только при реальном изменении пользователем (blockSignals при программном предвыборе); hot-plug намеренно НЕ отслеживается (у PortAudio нет уведомлений о смене устройств); флаги CLI record --mic-id/--loopback-id намеренно остались обязательными (детерминированный скриптинг).
+- (2026-09-21) ADR-001 (soundcard → PyAudioWPatch) реализован 2026-09-21: новый app/audio/backend.py (ленивый синглтон PyAudio, единственная точка создания инстанса), identity устройства = ИМЯ (GUI combo data и CLI --mic-id/--loopback-id теперь = имя из list-devices, не endpoint id), native rate per-device из defaultSampleRate. Ждёт ручного чек-листа ADR на Windows с Jabra (п.1 — критичный риск R1).
+
+## Goals
+- (2026-09-21) (2026-09-21) Верифицировать на Windows (нет в dev-окружении): (1) на старте GUI предвыбираются дефолтные устройства (микрофон + loopback вывода по умолчанию, маркеры в list-devices); (2) ручной выбор combo сохраняется между запусками (HKCU\Software\LiveRecorder\LiveRecorder) и бьёт авто-предвыбор; (3) get_default_*_device_info() PyAudioWPatch реально возвращают dict с isLoopbackDevice (допущение, покрыто только фейками).
+- (2026-09-21) После миграции ADR-001 (2026-09-21) аудио-захват снова не верифицирован на железе: выполнить чек-лист ADR п.1–11 на Windows с Jabra Evolve2 30 SE; п.1 (Jabra открывается без AssertionError в paFloat32 на defaultSampleRate) — первый и главный шаг, митигция R1 — is_format_supported() перед open().
+
+## Summary experiments (summary_tests/, 2026-09-25)
+- Three self-contained summarization strategies for long transcripts: `map_reduce/`,
+  `eacss/` (extractive via embeddings+k-means → abstractive LLM),
+  `hierarchical_context/` (Context-Aware Hierarchical Merging, Extract-Support variant,
+  Ou & Lapata ACL 2025). Input: .txt or transcript.json; output: output/<name>.md.
+- **FrankAI LLM is unusably slow without `reasoning_effort="medium"`** passed via
+  `extra_body={"allowed_openai_params": ["reasoning_effort"]}` on every
+  chat.completions.create (~60-90s+ per call without it, ~25-35s with). Any new LLM
+  call in this project MUST include it.
+- Extractive phases use a REMOTE OpenAI-compatible embeddings endpoint (env
+  `EMBED_URL`/`EMBED_API_KEY`/`EMBED_MODEL`) — user provisions it on demand; no local
+  BERT/rerank models are installed. Chunk size 32000 chars (~8K tokens, per ACL 2025).
